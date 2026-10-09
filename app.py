@@ -21,8 +21,10 @@ from google.genai import errors as genai_errors
 from google.genai import types
 from PIL import Image, ImageOps
 
-# Free-tier friendly model. Change via GEMINI_MODEL secret/env if Google renames it.
-DEFAULT_MODEL = "gemini-2.5-flash"
+# Tried in this order; if Google retires one (404 NOT_FOUND) the next is used automatically.
+# Override with the GEMINI_MODEL secret/env (one name, or several separated by commas).
+DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"]
+_working_model = {}   # remembers the model that last worked, so we do not re-probe every card
 MAX_SIDE = 1600   # photos are shrunk to this before being stored / sent
 MAX_PENDING = 60  # max cards being read at the same time
 WORKERS = 2       # cards read in parallel (free tier has low requests/minute)
@@ -118,6 +120,18 @@ def parse_json(text: str) -> dict:
     return json.loads(text[start : end + 1])
 
 
+def _generate(client, model_name, content, config):
+    """One model call; retries on rate-limit (429) / server busy (5xx)."""
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return client.models.generate_content(model=model_name, contents=content, config=config)
+        except genai_errors.APIError as e:
+            retryable = e.code in (429, 500, 502, 503, 504)
+            if not retryable or attempt == MAX_RETRIES:
+                raise
+            time.sleep(6 * (2**attempt))  # 6s, 12s, 24s, 48s - free tier limits reset per minute
+
+
 def extract_card(client, model, front, back) -> dict:
     """front/back are (filename, jpeg_bytes) or None."""
     content = [PROMPT]
@@ -130,16 +144,24 @@ def extract_card(client, model, front, back) -> dict:
         response_mime_type="application/json",
         temperature=0,
     )
-    resp = None
-    for attempt in range(MAX_RETRIES + 1):
+    models = [m.strip() for m in (model or "").split(",") if m.strip()] or list(DEFAULT_MODELS)
+    good = _working_model.get("name")
+    if good in models:
+        models = [good] + [m for m in models if m != good]
+
+    resp, not_found = None, None
+    for name in models:
         try:
-            resp = client.models.generate_content(model=model, contents=content, config=config)
+            resp = _generate(client, name, content, config)
+            _working_model["name"] = name
             break
         except genai_errors.APIError as e:
-            retryable = e.code in (429, 500, 502, 503, 504)
-            if not retryable or attempt == MAX_RETRIES:
-                raise
-            time.sleep(6 * (2**attempt))  # 6s, 12s, 24s, 48s - free tier limits reset per minute
+            if e.code == 404:        # model retired / not available -> try the next one
+                not_found = e
+                continue
+            raise
+    if resp is None:
+        raise not_found
     data = parse_json(resp.text or "")
     row = {h: str(data.get(h, "") or "").strip() for h in HEADERS[:-2]}
     row["Front File"] = front[0] if front else ""
@@ -511,7 +533,7 @@ def main():
             st.session_state.clear()
             st.rerun()
 
-    ss.model = get_secret("GEMINI_MODEL") or DEFAULT_MODEL
+    ss.model = get_secret("GEMINI_MODEL")
     if api_key and ss.get("client_key") != api_key:
         ss.client, ss.client_key = genai.Client(api_key=api_key), api_key
     elif not api_key:
