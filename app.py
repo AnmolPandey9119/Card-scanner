@@ -18,24 +18,14 @@ from itertools import zip_longest
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
-from google import genai
-from google.genai import errors as genai_errors
-from google.genai import types
 from groq import Groq
 from groq import BadRequestError as GroqBadRequest
 from groq import InternalServerError as GroqServerError
 from groq import RateLimitError as GroqRateLimit
 from PIL import Image, ImageOps
 
-# Tried in this order; if Google retires one (404 NOT_FOUND) the next is used automatically.
-# Override with the GEMINI_MODEL secret/env (one name, or several separated by commas).
-DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"]
-_working_model = {}   # remembers the model that last worked, so we do not re-probe every card
-
-# Backup provider (free, no card): used when Gemini's free quota is finished or Gemini fails.
+# Groq (free, no card): https://console.groq.com/keys
 DEFAULT_GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-GEMINI_COOLDOWN = 120   # seconds to skip Gemini after it says "quota exhausted" (429)
-_gemini_state = {"skip_until": 0.0}
 MAX_SIDE = 1600   # photos are shrunk to this before being stored / sent
 MAX_PENDING = 60  # max cards being read at the same time
 WORKERS = 2       # cards read in parallel (free tier has low requests/minute)
@@ -192,10 +182,6 @@ def compress_image(file_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
-def image_block(jpeg_bytes: bytes, label: str) -> list:
-    return [label, types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")]
-
-
 def parse_json(text: str) -> dict:
     text = text.strip()
     text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
@@ -203,48 +189,6 @@ def parse_json(text: str) -> dict:
     if start == -1 or end == -1:
         raise ValueError("No JSON found in model reply")
     return json.loads(text[start : end + 1])
-
-
-def _generate(client, model_name, content, config, retries):
-    """One Gemini call; retries on rate-limit (429) / server busy (5xx) up to `retries` times."""
-    for attempt in range(retries + 1):
-        try:
-            return client.models.generate_content(model=model_name, contents=content, config=config)
-        except genai_errors.APIError as e:
-            retryable = e.code in (429, 500, 502, 503, 504)
-            if not retryable or attempt == retries:
-                raise
-            time.sleep(6 * (2**attempt))  # 6s, 12s, 24s, 48s - free tier limits reset per minute
-
-
-def _gemini_text(client, model, front, back, has_backup) -> str:
-    content = [PROMPT]
-    if front:
-        content += image_block(front[1], "FRONT of the card:")
-    if back:
-        content += image_block(back[1], "BACK of the card:")
-    config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
-
-    models = [m.strip() for m in (model or "").split(",") if m.strip()] or list(DEFAULT_MODELS)
-    good = _working_model.get("name")
-    if good in models:
-        models = [good] + [m for m in models if m != good]
-    retries = 0 if has_backup else MAX_RETRIES   # with a backup, do not wait - switch right away
-
-    resp, not_found = None, None
-    for name in models:
-        try:
-            resp = _generate(client, name, content, config, retries)
-            _working_model["name"] = name
-            break
-        except genai_errors.APIError as e:
-            if e.code == 404:        # model retired / not available -> try the next one
-                not_found = e
-                continue
-            raise
-    if resp is None:
-        raise not_found
-    return resp.text or ""
 
 
 def _groq_text(client, model, front, back) -> str:
@@ -274,30 +218,11 @@ def _groq_text(client, model, front, back) -> str:
 
 
 def extract_card(engines, model, front, back) -> dict:
-    """front/back are (filename, jpeg_bytes) or None.
-    engines = {"gemini": client|None, "groq": client|None, "groq_model": str}.
-    Gemini first; Groq if Gemini is out of quota / fails / is not configured."""
-    gem, grq = engines.get("gemini"), engines.get("groq")
-    text, gem_err = None, None
-
-    if gem and time.time() >= _gemini_state["skip_until"]:
-        try:
-            text = _gemini_text(gem, model, front, back, has_backup=bool(grq))
-        except genai_errors.APIError as e:
-            gem_err = e
-            if e.code == 429:        # quota finished: skip Gemini for a while, go straight to Groq
-                _gemini_state["skip_until"] = time.time() + GEMINI_COOLDOWN
-            if not grq:
-                raise
-    if text is None:
-        if not grq:
-            raise RuntimeError("Koi API key set nahi hai (GEMINI_API_KEY ya GROQ_API_KEY).")
-        try:
-            text = _groq_text(grq, engines.get("groq_model") or DEFAULT_GROQ_MODEL, front, back)
-        except Exception as e:
-            if gem_err is not None:
-                raise RuntimeError(f"Gemini: {gem_err} | Groq: {e}") from e
-            raise
+    """front/back are (filename, jpeg_bytes) or None. Groq only."""
+    grq = engines.get("groq")
+    if not grq:
+        raise RuntimeError("GROQ_API_KEY set nahi hai.")
+    text = _groq_text(grq, engines.get("groq_model") or DEFAULT_GROQ_MODEL, front, back)
 
     data = parse_json(text)
     row = {h: str(data.get(h, "") or "").strip() for h in HEADERS[:-2]}
@@ -477,7 +402,7 @@ def submit_card(front, back, raw=False) -> bool:
     """Send one card (front + optional back) to be read in the background right away."""
     ss = st.session_state
     if not ss.get("client"):
-        st.error("API key nahi mili (Gemini ya Groq). Sidebar me daalo ya server env/secrets me set karo.")
+        st.error("Groq API key nahi mili. Sidebar me daalo ya server env/secrets me set karo.")
         return False
     if ss.store.pending() >= MAX_PENDING:
         st.error(f"Ek saath max {MAX_PENDING} cards read ho sakte hain. Thoda ruko, pehle wale ho jayen.")
@@ -636,7 +561,7 @@ def results_panel():
             store.retry_failed(ss.client, ss.model)
             st.rerun()
         else:
-            st.error("API key nahi mili (Gemini ya Groq).")
+            st.error("Groq API key nahi mili.")
     with st.expander("Sab cards clear karo"):
         if st.button("🗑️ Clear all cards"):
             ss.store = CardStore()
@@ -658,13 +583,10 @@ def main():
     st.title("📇 Visiting Card Scanner")
     st.caption("Card ki photo lo ya upload karo (front + back) → turant read hoke Excel me judta jayega → jab chahein Export.")
 
-    gem_key = get_secret("GEMINI_API_KEY")
     groq_key = get_secret("GROQ_API_KEY")
     with st.sidebar:
-        if not gem_key:
-            gem_key = st.text_input("Gemini API key", type="password")
         if not groq_key:
-            groq_key = st.text_input("Groq API key (backup, optional)", type="password")
+            groq_key = st.text_input("Groq API key", type="password")
         st.markdown(
             "**Kaise use karein**\n\n"
             "1. Phone scan se card (front + back) save karo\n"
@@ -677,16 +599,15 @@ def main():
             st.session_state.clear()
             st.rerun()
 
-    ss.model = get_secret("GEMINI_MODEL")
-    keys = (gem_key, groq_key, get_secret("GROQ_MODEL"))
+    ss.model = ""
+    keys = (groq_key, get_secret("GROQ_MODEL"))
     if ss.get("client_key") != keys:
         ss.client_key = keys
         ss.client = None
-        if gem_key or groq_key:
+        if groq_key:
             ss.client = {
-                "gemini": genai.Client(api_key=gem_key) if gem_key else None,
-                "groq": Groq(api_key=groq_key) if groq_key else None,
-                "groq_model": keys[2] or DEFAULT_GROQ_MODEL,
+                "groq": Groq(api_key=groq_key),
+                "groq_model": keys[1] or DEFAULT_GROQ_MODEL,
             }
 
     tab_phone, tab_cam, tab_up = st.tabs(["📱 Phone scan", "📷 Browser camera", "📁 Bulk upload"])

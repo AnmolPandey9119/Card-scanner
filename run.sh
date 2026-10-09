@@ -8,7 +8,7 @@ if [ ! -d venv ]; then
 else
   source venv/bin/activate
 fi
-if [ -z "$GEMINI_API_KEY" ] && [ -f api_key.txt ]; then
-  export GEMINI_API_KEY="$(cat api_key.txt)"
+if [ -z "$GROQ_API_KEY" ] && [ -f api_key.txt ]; then
+  export GROQ_API_KEY="$(cat api_key.txt)"
 fi
 streamlit run app.py
