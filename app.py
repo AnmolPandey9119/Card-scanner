@@ -20,7 +20,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 
-from ocr_engine import read_card, warmup
+import gemini_engine
+from card_reader import read_card, warmup
 
 MAX_SIDE = 1280   # photos are shrunk to this before being stored / sent
 MAX_PENDING = 60  # max cards being read at the same time
@@ -499,6 +500,11 @@ def results_panel():
 
 
 def main():
+    if get_secret("GEMINI_API_KEY"):   # make secrets visible to gemini_engine
+        os.environ["GEMINI_API_KEY"] = get_secret("GEMINI_API_KEY")
+    for _k in ("GEMINI_MODELS", "GEMINI_RPM"):
+        if get_secret(_k):
+            os.environ[_k] = get_secret(_k)
     warmup()   # load OCR model in background while the page renders
     st.set_page_config(page_title="Visiting Card Scanner", page_icon="📇", layout="wide")
     st.markdown(STYLE, unsafe_allow_html=True)
@@ -522,6 +528,13 @@ def main():
             "4. *Export Excel*\n\n"
             "Saare cards ek hi Excel me jud jate hain."
         )
+        if gemini_engine.enabled():
+            fb = gemini_engine.status["fallbacks"]
+            st.caption("🤖 Gemini ON" + (f" · {fb} card(s) offline OCR se read hue (Gemini limit)" if fb else ""))
+            if gemini_engine.status["last"]:
+                st.caption(gemini_engine.status["last"])
+        else:
+            st.caption("💻 Offline OCR mode (Gemini key nahi hai)")
         if get_secret("APP_PASSWORD") and st.button("Logout"):
             st.session_state.clear()
             st.rerun()
