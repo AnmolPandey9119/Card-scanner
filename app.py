@@ -4,6 +4,7 @@ Every card is read in the background the moment you add it and its row goes
 straight into the Excel, so "Export Excel" is instant.
 Run locally:  streamlit run app.py
 """
+import base64
 import hmac
 import io
 import json
@@ -20,12 +21,21 @@ import streamlit.components.v1 as components
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
+from groq import Groq
+from groq import BadRequestError as GroqBadRequest
+from groq import InternalServerError as GroqServerError
+from groq import RateLimitError as GroqRateLimit
 from PIL import Image, ImageOps
 
 # Tried in this order; if Google retires one (404 NOT_FOUND) the next is used automatically.
 # Override with the GEMINI_MODEL secret/env (one name, or several separated by commas).
 DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"]
 _working_model = {}   # remembers the model that last worked, so we do not re-probe every card
+
+# Backup provider (free, no card): used when Gemini's free quota is finished or Gemini fails.
+DEFAULT_GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+GEMINI_COOLDOWN = 120   # seconds to skip Gemini after it says "quota exhausted" (429)
+_gemini_state = {"skip_until": 0.0}
 MAX_SIDE = 1600   # photos are shrunk to this before being stored / sent
 MAX_PENDING = 60  # max cards being read at the same time
 WORKERS = 2       # cards read in parallel (free tier has low requests/minute)
@@ -126,10 +136,36 @@ STYLE = """
 div.stButton > button, div.stDownloadButton > button {
     width: 100%; min-height: 3rem; font-size: 1.05rem; border-radius: 10px;
 }
+button { touch-action: manipulation; }   /* no double-tap-zoom delay -> fast repeated taps */
+
+/* Browser camera: big "Take Photo" bar so cards can be shot quickly */
+[data-testid="stCameraInputButton"] {
+    min-height: 5rem !important;
+    background: #1F4E78 !important;
+    border-radius: 0 0 10px 10px;
+}
+[data-testid="stCameraInputButton"], [data-testid="stCameraInputButton"] * {
+    font-size: 1.5rem !important; font-weight: 700 !important; color: #fff !important;
+}
+
 footer {visibility: hidden;}
 @media (max-width: 640px) {
     .block-container {padding: 1rem 0.8rem 5rem 0.8rem;}
     h1 {font-size: 1.7rem !important;}
+    /* bigger buttons for Next / Save / Skip on phones */
+    div.stButton > button, div.stDownloadButton > button {min-height: 3.6rem; font-size: 1.2rem;}
+    [data-testid="stCameraInputButton"] {min-height: 7rem !important;}
+    [data-testid="stCameraInputButton"], [data-testid="stCameraInputButton"] * {font-size: 1.8rem !important;}
+    /* Phone scan / upload: one huge tap area instead of a small "Browse files" button */
+    [data-testid="stFileUploaderDropzone"] {
+        min-height: 9rem; justify-content: center; border-radius: 12px;
+        padding: 0.5rem;
+    }
+    [data-testid="stFileUploaderDropzoneInstructions"] {display: none;}
+    [data-testid="stFileUploaderDropzone"] button {
+        width: 100%; min-height: 6rem; font-size: 1.5rem; font-weight: 700;
+        background: #1F4E78; color: #fff; border-radius: 12px;
+    }
 }
 </style>
 """
@@ -169,39 +205,36 @@ def parse_json(text: str) -> dict:
     return json.loads(text[start : end + 1])
 
 
-def _generate(client, model_name, content, config):
-    """One model call; retries on rate-limit (429) / server busy (5xx)."""
-    for attempt in range(MAX_RETRIES + 1):
+def _generate(client, model_name, content, config, retries):
+    """One Gemini call; retries on rate-limit (429) / server busy (5xx) up to `retries` times."""
+    for attempt in range(retries + 1):
         try:
             return client.models.generate_content(model=model_name, contents=content, config=config)
         except genai_errors.APIError as e:
             retryable = e.code in (429, 500, 502, 503, 504)
-            if not retryable or attempt == MAX_RETRIES:
+            if not retryable or attempt == retries:
                 raise
             time.sleep(6 * (2**attempt))  # 6s, 12s, 24s, 48s - free tier limits reset per minute
 
 
-def extract_card(client, model, front, back) -> dict:
-    """front/back are (filename, jpeg_bytes) or None."""
+def _gemini_text(client, model, front, back, has_backup) -> str:
     content = [PROMPT]
     if front:
         content += image_block(front[1], "FRONT of the card:")
     if back:
         content += image_block(back[1], "BACK of the card:")
+    config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
 
-    config = types.GenerateContentConfig(
-        response_mime_type="application/json",
-        temperature=0,
-    )
     models = [m.strip() for m in (model or "").split(",") if m.strip()] or list(DEFAULT_MODELS)
     good = _working_model.get("name")
     if good in models:
         models = [good] + [m for m in models if m != good]
+    retries = 0 if has_backup else MAX_RETRIES   # with a backup, do not wait - switch right away
 
     resp, not_found = None, None
     for name in models:
         try:
-            resp = _generate(client, name, content, config)
+            resp = _generate(client, name, content, config, retries)
             _working_model["name"] = name
             break
         except genai_errors.APIError as e:
@@ -211,7 +244,62 @@ def extract_card(client, model, front, back) -> dict:
             raise
     if resp is None:
         raise not_found
-    data = parse_json(resp.text or "")
+    return resp.text or ""
+
+
+def _groq_text(client, model, front, back) -> str:
+    content = [{"type": "text", "text": PROMPT}]
+    for label, img in (("FRONT of the card:", front), ("BACK of the card:", back)):
+        if img:
+            b64 = base64.b64encode(img[1]).decode()
+            content.append({"type": "text", "text": label})
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+
+    kwargs = dict(model=model, messages=[{"role": "user", "content": content}], temperature=0, max_tokens=1500)
+    json_mode = True
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            extra = {"response_format": {"type": "json_object"}} if json_mode else {}
+            resp = client.chat.completions.create(**kwargs, **extra)
+            return resp.choices[0].message.content or ""
+        except GroqBadRequest:
+            if not json_mode:
+                raise
+            json_mode = False        # model refused JSON mode with images -> retry as plain text
+        except (GroqRateLimit, GroqServerError):
+            if attempt == MAX_RETRIES:
+                raise
+            time.sleep(6 * (2**attempt))
+    raise RuntimeError("Groq did not return a result")
+
+
+def extract_card(engines, model, front, back) -> dict:
+    """front/back are (filename, jpeg_bytes) or None.
+    engines = {"gemini": client|None, "groq": client|None, "groq_model": str}.
+    Gemini first; Groq if Gemini is out of quota / fails / is not configured."""
+    gem, grq = engines.get("gemini"), engines.get("groq")
+    text, gem_err = None, None
+
+    if gem and time.time() >= _gemini_state["skip_until"]:
+        try:
+            text = _gemini_text(gem, model, front, back, has_backup=bool(grq))
+        except genai_errors.APIError as e:
+            gem_err = e
+            if e.code == 429:        # quota finished: skip Gemini for a while, go straight to Groq
+                _gemini_state["skip_until"] = time.time() + GEMINI_COOLDOWN
+            if not grq:
+                raise
+    if text is None:
+        if not grq:
+            raise RuntimeError("Koi API key set nahi hai (GEMINI_API_KEY ya GROQ_API_KEY).")
+        try:
+            text = _groq_text(grq, engines.get("groq_model") or DEFAULT_GROQ_MODEL, front, back)
+        except Exception as e:
+            if gem_err is not None:
+                raise RuntimeError(f"Gemini: {gem_err} | Groq: {e}") from e
+            raise
+
+    data = parse_json(text)
     row = {h: str(data.get(h, "") or "").strip() for h in HEADERS[:-2]}
     row["Front File"] = front[0] if front else ""
     row["Back File"] = back[0] if back else ""
@@ -389,7 +477,7 @@ def submit_card(front, back, raw=False) -> bool:
     """Send one card (front + optional back) to be read in the background right away."""
     ss = st.session_state
     if not ss.get("client"):
-        st.error("Gemini API key nahi mili. Sidebar me daalo ya server secrets me set karo.")
+        st.error("API key nahi mili (Gemini ya Groq). Sidebar me daalo ya server env/secrets me set karo.")
         return False
     if ss.store.pending() >= MAX_PENDING:
         st.error(f"Ek saath max {MAX_PENDING} cards read ho sakte hain. Thoda ruko, pehle wale ho jayen.")
@@ -548,7 +636,7 @@ def results_panel():
             store.retry_failed(ss.client, ss.model)
             st.rerun()
         else:
-            st.error("Gemini API key nahi mili.")
+            st.error("API key nahi mili (Gemini ya Groq).")
     with st.expander("Sab cards clear karo"):
         if st.button("🗑️ Clear all cards"):
             ss.store = CardStore()
@@ -570,10 +658,13 @@ def main():
     st.title("📇 Visiting Card Scanner")
     st.caption("Card ki photo lo ya upload karo (front + back) → turant read hoke Excel me judta jayega → jab chahein Export.")
 
-    api_key = get_secret("GEMINI_API_KEY")
+    gem_key = get_secret("GEMINI_API_KEY")
+    groq_key = get_secret("GROQ_API_KEY")
     with st.sidebar:
-        if not api_key:
-            api_key = st.text_input("Gemini API key", type="password")
+        if not gem_key:
+            gem_key = st.text_input("Gemini API key", type="password")
+        if not groq_key:
+            groq_key = st.text_input("Groq API key (backup, optional)", type="password")
         st.markdown(
             "**Kaise use karein**\n\n"
             "1. Phone scan se card (front + back) save karo\n"
@@ -587,10 +678,16 @@ def main():
             st.rerun()
 
     ss.model = get_secret("GEMINI_MODEL")
-    if api_key and ss.get("client_key") != api_key:
-        ss.client, ss.client_key = genai.Client(api_key=api_key), api_key
-    elif not api_key:
-        ss.client, ss.client_key = None, None
+    keys = (gem_key, groq_key, get_secret("GROQ_MODEL"))
+    if ss.get("client_key") != keys:
+        ss.client_key = keys
+        ss.client = None
+        if gem_key or groq_key:
+            ss.client = {
+                "gemini": genai.Client(api_key=gem_key) if gem_key else None,
+                "groq": Groq(api_key=groq_key) if groq_key else None,
+                "groq_model": keys[2] or DEFAULT_GROQ_MODEL,
+            }
 
     tab_phone, tab_cam, tab_up = st.tabs(["📱 Phone scan", "📷 Browser camera", "📁 Bulk upload"])
     with tab_phone:

@@ -17,7 +17,7 @@ Card ki **live photo** lo ya images **upload** karo (front + back). App saari de
 
 ## A) Apne computer par chalana (Windows)
 1. Python 3.10+ install karo (python.org, "Add to PATH" tick karo).
-2. Folder me `api_key.txt` banao, usme sirf apni **Gemini API key** paste karo (free, aistudio.google.com/apikey se milti hai).
+2. Folder me `api_key.txt` banao, usme sirf apni **Gemini API key** paste karo (free, aistudio.google.com/apikey se milti hai). Groq backup chahiye to `GROQ_API_KEY` environment variable set karo.
 3. `run.bat` double-click karo. Mac/Linux: `bash run.sh`.
 
 ---
@@ -29,6 +29,7 @@ Card ki **live photo** lo ya images **upload** karo (front + back). App saari de
 4. **Environment Variables** me ye daalo:
    ```
    GEMINI_API_KEY = AIza...
+   GROQ_API_KEY   = gsk_...        (free backup, neeche dekho)
    APP_PASSWORD   = koi-strong-password
    ```
 5. (Optional) Settings me **Health Check Path** `/_stcore/health` rakh do.
@@ -36,9 +37,16 @@ Card ki **live photo** lo ya images **upload** karo (front + back). App saari de
 
 ---
 
+## Free limit khatam ho jaye to (Gemini + Groq backup)
+- **Groq** ki free key console.groq.com/keys se milti hai (card/billing nahi lagti). Isse `GROQ_API_KEY` naam se Render env me daal do.
+- Dono keys hon to app pehle Gemini use karta hai. Gemini ki limit khatam ho (ya wo fail ho) to **apne aap Groq** se card read hota hai, aur kuch der Gemini ko chhod deta hai. Aapko kuch karna nahi padta.
+- Sirf Groq key ho (Gemini ki na ho) tab bhi app chalta hai.
+- Groq ka model `meta-llama/llama-4-scout-17b-16e-instruct` hai (vision wala). Badalna ho to `GROQ_MODEL` env set karo. Groq ki free limits console.groq.com par dekh lo.
+- Groq par bhi free tier me Google ki tarah privacy guarantee nahi hoti, to sensitive data ke liye dhyan rakho.
+
 ## Zaroori baatein
 - **Password zaroor set karo.** Bina password ke link jiske paas hoga wo aapki API key ka free quota khatam kar dega.
-- Free tier me requests/minute aur requests/day ki limit hoti hai. App rate-limit (429) par khud retry karta hai, to bade batch thode dheere chalenge. Limits AI Studio me dekh lo.
+- Free tier me requests/minute aur requests/day ki limit hoti hai. Sirf ek key ho to app rate-limit (429) par khud retry karta hai (bade batch thode dheere chalenge); dono keys hon to seedha doosre par chala jata hai.
 - Free tier me Google aapka data apne products sudharne ke liye use kar sakta hai. Cards me logon ke phone/email hote hain, to sensitive/client data ke liye paid key use karna better hai.
 - Model: app `gemini-3.8-flash` use karta hai, aur agar Google koi model band kar de (404) to khud agla (`gemini-3.5-flash`, `gemini-3.1-flash-lite`) try kar leta hai. Apna model chahiye to Render env me `GEMINI_MODEL = model-name` set karo (kai ho to comma se alag karo).
 - Phone par hamesha **📱 Phone scan** tab use karo: ye phone ka original camera kholta hai, quality sabse achhi aati hai.
