@@ -41,6 +41,33 @@ def _run(arr):
     return items
 
 
+_DOMAIN_RE = re.compile(r"[A-Za-z0-9\-]+\.(?:com|in|net|org|co|biz|info|co\.in)\b", re.I)
+
+
+def _recheck_at(arr, items):
+    """A box that looks like an email but has no '@' is read again from an enlarged crop
+    (small '@' signs are often misread as 'a' / dropped at the normal size)."""
+    H, W = arr.shape[:2]
+    for it in items:
+        t = it["text"]
+        if "@" in t or not _DOMAIN_RE.search(t) or re.match(r"(?i)\s*(https?://|www\.)", t):
+            continue
+        pad = max(6, int(it["h"] * 0.4))
+        x0, x1 = max(0, int(it["x"]) - pad), min(W, int(it["x"] + it["w"]) + pad)
+        y0, y1 = max(0, int(it["y"]) - pad), min(H, int(it["y"] + it["h"]) + pad)
+        crop = arr[y0:y1, x0:x1]
+        if crop.size == 0:
+            continue
+        scale = max(1.5, min(4.0, 80.0 / max(it["h"], 1)))
+        big = np.array(Image.fromarray(crop[:, :, ::-1]).resize(
+            (int(crop.shape[1] * scale), int(crop.shape[0] * scale)), Image.LANCZOS))[:, :, ::-1]
+        sub = sorted(_run(np.ascontiguousarray(big)), key=lambda d: d["x"])
+        new = "".join(d["text"] for d in sub)
+        if "@" in new:
+            it["text"] = new
+    return items
+
+
 def _score(items):
     """Rough quality: number of characters read (used to pick the best rotation)."""
     return sum(len(i["text"]) for i in items)
@@ -58,6 +85,7 @@ def ocr_lines(jpeg_bytes: bytes) -> list:
     img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
     arr = np.array(img)[:, :, ::-1]   # RGB -> BGR
     items = _run(arr)
+    items = _recheck_at(arr, items)
     portrait = arr.shape[0] > arr.shape[1] * 1.15   # cards are usually landscape -> may be sideways
     if portrait or _score(items) < 25:   # try 90 / 270 degrees as well
         cands = [items] + [_run(np.ascontiguousarray(np.rot90(arr, k))) for k in (1, 3)]
@@ -96,11 +124,16 @@ STATES = [
 ]
 COUNTRIES = ["India", "UAE", "United Arab Emirates", "USA", "United States", "UK", "United Kingdom",
              "Singapore", "Nepal", "Bangladesh", "Sri Lanka", "Australia", "Canada", "Germany"]
-DESIG_WORDS = r"""director|manager|founder|co-?founder|ceo|cto|cfo|coo|chairman|president|vice president|\bvp\b|
+DESIG_WORDS = r"""director|manager|founder|co-?founder|\bceo\b|\bcto\b|\bcfo\b|\bcoo\b|chairman|president|vice president|\bvp\b|
 partner|proprietor|owner|engineer|developer|consultant|executive|officer|head|lead|sales|marketing|
-associate|analyst|architect|designer|doctor|dr\.|advocate|ca\b|accountant|supervisor|incharge|in-charge|
+associate|analyst|architect|designer|doctor|dr\.|advocate|\bca\b|accountant|supervisor|incharge|in-charge|
 representative|general manager|\bgm\b|\bagm\b|\bmd\b|managing|proprieter|specialist|coordinator|
-administrator|business development|relationship"""
+administrator|business development|relationship|chief|senior|junior|\bsr\.?|\bjr\.?|trainee|intern|assistant|
+secretary|regional|zonal|dealer|distributor|franchise|agent|advisor|adviser|surgeon|professor|principal|
+trustee|treasurer|technician|operator|controller|auditor|instructor|trainer|dentist|physician|lawyer|attorney|
+counsel|programmer|scientist|strategist|planner|surveyor|contractor|broker|editor|producer|photographer|
+supervisor|inspector|incharge|proprietress|chairperson|chairwoman|promoter|expert|
+clerk|cashier|receptionist|\bhr\b|human resources?|admin\b|procurement|service engineer"""
 COMPANY_WORDS = r"""pvt|private|ltd|limited|llp|llc|inc\b|corp|company|co\.|enterprises?|solutions?|industries|
 industrial|traders?|trading|technologies|technology|tech\b|systems|services|associates|group|agency|agencies|
 exports?|imports?|international|global|infra|constructions?|builders|engineering|labs?|laboratories|
@@ -128,6 +161,11 @@ def _w(words):
 
 
 DESIG_RE, COMPANY_RE, ADDR_RE = _w(DESIG_WORDS), _w(COMPANY_WORDS), _w(ADDR_WORDS)
+STRONG_COMPANY_RE = re.compile(r"\b(?:pvt|private|ltd|limited|llp|llc|inc|corp|corporation|company|co|enterprises?|"
+                               r"industries|traders?|trading|associates|group|exports?|imports?)\b", re.I)
+STRONG_ADDR_RE = re.compile(r"\b(?:road|rd|street|nagar|colony|sector|plot|floor|building|bldg|tower|complex|lane|marg|"
+                            r"chowk|near|opp|opposite|behind|phase|block|village|district|po)\b", re.I)
+SPLIT_RE = re.compile(r"\s{2,}|\s[|/\u2022\u2013\u2014]\s|\s-\s")
 LABEL_RE = re.compile(r"^\s*(?:e-?mail|email|mail|web(?:site)?|url|tel(?:ephone)?|ph(?:one)?|mob(?:ile)?|cell|"
                       r"fax|whats\s?app|office|res|contact|call|m|t|p|e|w|f)\s*[:.\-|/]+\s*", re.I)
 
@@ -155,7 +193,35 @@ def _split_phone(raw: str):
 
 
 def _clean_line(t):
-    return re.sub(r"\s{2,}", " ", t).strip(" |,;:-")
+    return t.strip(" |,;:-")   # keep double spaces: they mark gaps between separate text boxes
+
+
+AT_FIXES = [
+    (re.compile(r"\(\s*a\s*\)|\[\s*at\s*\]|\(\s*at\s*\)|[\u00a9\u00ae\uff20]", re.I), "@"),   # (a) [at] (c) (R) -> @
+    (re.compile(r"(\.(?:com|net|org|biz|info|in))[|/\\IJ](?=[A-Za-z0-9._-]+@)"), r"\1 "),   # two emails glued by | / \ I J
+]
+EMAIL_LABEL_RE = re.compile(r"e-?\s?mail|\bmail\b|^\s*e\s*[:.\-|]", re.I)
+
+
+def fix_at(text: str) -> str:
+    for rx, rep in AT_FIXES:
+        text = rx.sub(rep, text)
+    return text
+
+
+def repair_email(token: str, hosts: list) -> str:
+    """OCR often turns '@' into 'a' (or drops it): 'rajeshasharmatraders.com' -> 'rajesh@sharmatraders.com'.
+    The email domain is usually the same as the website, so use the website host to find the split."""
+    t = token.strip().lower()
+    for h in sorted(hosts, key=len, reverse=True):
+        if t.endswith(h) and len(t) > len(h):
+            local = t[: -len(h)]
+            if len(local) >= 3 and local[-1] in "a@":
+                local = local[:-1]
+            local = local.strip(".-_ ")
+            if local:
+                return f"{local}@{h}"
+    return t
 
 
 def parse_card(front_lines: list, back_lines: list) -> dict:
@@ -165,19 +231,21 @@ def parse_card(front_lines: list, back_lines: list) -> dict:
                            "Services / Products", "Other Notes"]}
 
     def add(k, v):
-        v = v.strip()
+        v = re.sub(r"\s+", " ", v).strip()
         if v and v.lower() not in [x.lower() for x in out[k]]:
             out[k].append(v)
 
+    email_cands = []
     sides = [("front", front_lines or []), ("back", back_lines or [])]
     leftovers = {"front": [], "back": []}
     gst_found = set()
 
     for side, lines in sides:
         for ln in lines:
-            text = ln["text"]
+            text = fix_at(ln["text"])
             rest = text
             hit = False
+            email_label = bool(EMAIL_LABEL_RE.search(text))
 
             for g in GST_RE.findall(text.replace(" ", "").upper()):
                 gst_found.add(g)
@@ -197,6 +265,8 @@ def parse_card(front_lines: list, back_lines: list) -> dict:
                     continue
                 if SOCIAL_RE.search(u):
                     add("LinkedIn / Social", u)
+                elif email_label and not re.match(r"(?i)(https?://|www\.)", u):
+                    email_cands.append(u)          # looks like an email whose '@' was misread
                 else:
                     add("Website", u)
                 rest = rest.replace(m, " ")
@@ -227,9 +297,25 @@ def parse_card(front_lines: list, back_lines: list) -> dict:
             if rest and (not hit or len(re.sub(r"[^A-Za-z]", "", rest)) >= 4):
                 leftovers[side].append({**ln, "text": rest})
 
+    # emails whose '@' was lost: rebuild using the website host
+    hosts = [re.sub(r"(?i)^(https?://)?(www\.)?", "", w).split("/")[0].lower() for w in out["Website"]]
+    for c in email_cands:
+        add("Email", repair_email(c, hosts))
+
     # ---- classify leftovers ----
     front_left = leftovers["front"]
     back_left = leftovers["back"]
+    # "Rajesh Kumar | Director" on one line -> two lines (only when exactly one part is a designation)
+    for side in ("front", "back"):
+        new = []
+        for l in leftovers[side]:
+            parts = [p.strip() for p in SPLIT_RE.split(l["text"]) if p.strip()]
+            flags = [bool(DESIG_RE.search(p)) and not STRONG_COMPANY_RE.search(p) for p in parts]
+            if len(parts) >= 2 and 0 < sum(flags) < len(parts) and not PIN_RE.search(l["text"]):
+                new += [{**l, "text": p} for p in parts]
+            else:
+                new.append(l)
+        leftovers[side] = new
     all_left = [(s, l) for s in ("front", "back") for l in leftovers[s]]
 
     used = set()
@@ -237,11 +323,22 @@ def parse_card(front_lines: list, back_lines: list) -> dict:
     def take(idx):
         used.add(idx)
 
+    # designation first (so words like "Marketing" / "Main" do not push it into company / address)
+    for i, (s, l) in enumerate(all_left):
+        t = l["text"]
+        if (DESIG_RE.search(t) and not re.search(r"\d", t) and not STRONG_COMPANY_RE.search(t)
+                and not STRONG_ADDR_RE.search(t) and len(t) < 60 and len(out["Designation"]) < 2):
+            add("Designation", t)
+            take(i)
+
     # address: lines with address keywords or a pincode, plus neighbours that look like continuation
     addr_idx = []
     for i, (s, l) in enumerate(all_left):
         t = l["text"]
-        if PIN_RE.search(t) or ADDR_RE.search(t) or any(re.search(rf"\b{re.escape(st)}\b", t, re.I) for st in STATES):
+        if i in used:
+            continue
+        weak_ok = bool(ADDR_RE.search(t)) and (STRONG_ADDR_RE.search(t) or re.search(r"\d|,", t))
+        if PIN_RE.search(t) or weak_ok or any(re.search(rf"\b{re.escape(st)}\b", t, re.I) for st in STATES):
             if not (COMPANY_RE.search(t) and not ADDR_RE.search(t) and not PIN_RE.search(t)):
                 addr_idx.append(i)
     # fill a single-line gap between two address lines on the same side
@@ -251,7 +348,7 @@ def parse_card(front_lines: list, back_lines: list) -> dict:
             if not DESIG_RE.search(mid) and not COMPANY_RE.search(mid):
                 addr_idx.append(a + 1)
     addr_idx = sorted(set(addr_idx))
-    addr_text = ", ".join(all_left[i][1]["text"] for i in addr_idx)
+    addr_text = re.sub(r"\s+", " ", ", ".join(all_left[i][1]["text"] for i in addr_idx))
     for i in addr_idx:
         take(i)
 
@@ -290,9 +387,9 @@ def parse_card(front_lines: list, back_lines: list) -> dict:
             add("City", city.title() if city.isupper() else city)
         out["Address"].append(addr_text)
 
-    # designation
+    # designation (second chance: lines that mention company-like words but are short)
     for i, (s, l) in enumerate(all_left):
-        if i not in used and DESIG_RE.search(l["text"]) and not COMPANY_RE.search(l["text"]) and len(l["text"]) < 60:
+        if i not in used and DESIG_RE.search(l["text"]) and not STRONG_COMPANY_RE.search(l["text"]) and len(l["text"]) < 60:
             add("Designation", l["text"])
             take(i)
             if len(out["Designation"]) >= 2:
@@ -328,6 +425,18 @@ def parse_card(front_lines: list, back_lines: list) -> dict:
                 pick = name_cands[0]
         add("Name", all_left[pick][1]["text"])
         take(pick)
+
+    if not out["Designation"] and out["Name"]:   # line right below (or above) the name, if it looks like a title
+        ni = next((i for i, (s, l) in enumerate(all_left) if l["text"] == out["Name"][0]), None)
+        for j in ([ni + 1, ni - 1] if ni is not None else []):
+            if 0 <= j < len(all_left) and j not in used and all_left[j][0] == "front":
+                t = all_left[j][1]["text"]
+                if (re.fullmatch(r"[A-Za-z&.,/\- ]{3,40}", t) and len(t.split()) <= 5
+                        and not STRONG_COMPANY_RE.search(t) and not STRONG_ADDR_RE.search(t)
+                        and all_left[j][1]["h"] <= all_left[ni][1]["h"] * 1.15):
+                    add("Designation", t)
+                    take(j)
+                    break
 
     if not out["Company"]:   # fall back to the largest remaining front line
         rem = [i for i, (s, l) in enumerate(all_left) if i not in used and s == "front"
