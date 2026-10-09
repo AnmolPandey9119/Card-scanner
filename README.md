@@ -4,7 +4,7 @@ Card ki **live photo** lo ya images **upload** karo (front + back). App saari de
 
 ## Features
 - **📱 Phone scan (mobile ke liye best):** phone ka original rear camera khulta hai. "Take Photo" chuno, front → back → save, phir agla card
-- 📷 Browser camera: seedha browser ka camera (laptop par theek, kuch phones par selfie camera khul sakta hai)
+- 📷 Browser camera: seedha browser ka camera (laptop par theek; mobile par back camera apne aap khulta hai)
 - 📁 Bulk upload: bahut saari images ek saath, front/back auto-pair
 - Mobile friendly: bade buttons, chhoti screen ke hisaab se layout
 - **Live processing:** card (front + back) save/add karte hi wo background me read hona shuru ho jata hai, aap agla card le sakte ho. Status (ready / reading / failed) live dikhta hai
@@ -42,7 +42,7 @@ Card ki **live photo** lo ya images **upload** karo (front + back). App saari de
 - Free tier me Google aapka data apne products sudharne ke liye use kar sakta hai. Cards me logon ke phone/email hote hain, to sensitive/client data ke liye paid key use karna better hai.
 - Model: app `gemini-3.8-flash` use karta hai, aur agar Google koi model band kar de (404) to khud agla (`gemini-3.5-flash`, `gemini-3.1-flash-lite`) try kar leta hai. Apna model chahiye to Render env me `GEMINI_MODEL = model-name` set karo (kai ho to comma se alag karo).
 - Phone par hamesha **📱 Phone scan** tab use karo: ye phone ka original camera kholta hai, quality sabse achhi aati hai.
-- "Browser camera" sirf **HTTPS** (deployed link) ya localhost par chalta hai.
+- "Browser camera" sirf **HTTPS** (deployed link) ya localhost par chalta hai. Mobile par ye ab apne aap **back camera** kholta hai (laptop par jo ek webcam hai wahi chalega).
 - **Render free plan:** 15 minute koi traffic na aaye to service sleep ho jati hai, aur dobara kholne par ek minute tak lag sakta hai. Event se pehle ek baar kholke jaga lo. Free service restart/sleep hone par server ki memory aur files dono jaati hain, to sab cards/Excel chale jayenge.
 - Photo ke saath sirf card ki details Gemini API ko jaati hain; app khud kuch store nahi karta. Cards aur Excel server ki memory me is session tak rehte hain. Tab refresh/band karne ya Render ke sleep/restart par chale jate hain. Isliye beech-beech me Export Excel karte raho. Export dabane par sirf wahi cards aayenge jo tab tak read ho chuke hain.
 - Columns badalne ho to `app.py` ke upar `HEADERS` edit karo.
