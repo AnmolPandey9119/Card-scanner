@@ -1,6 +1,6 @@
 # 📇 Visiting Card Scanner
 
-Card ki **live photo** lo ya images **upload** karo (front + back). App saari details nikaal kar ek Excel bana deta hai.
+Card ki **live photo** lo ya images **upload** karo (front + back). App saari details nikaal kar ek Excel bana deta hai. **100% free: OCR local chalta hai (RapidOCR), koi API key / internet / paisa nahi.**
 
 ## Features
 - **📱 Phone scan (mobile ke liye best):** phone ka original rear camera khulta hai. "Take Photo" chuno, front → back → save, phir agla card
@@ -17,7 +17,7 @@ Card ki **live photo** lo ya images **upload** karo (front + back). App saari de
 
 ## A) Apne computer par chalana (Windows)
 1. Python 3.10+ install karo (python.org, "Add to PATH" tick karo).
-2. Folder me `api_key.txt` banao, usme sirf apni **Gemini API key** paste karo (free, aistudio.google.com/apikey se milti hai). Groq backup chahiye to `GROQ_API_KEY` environment variable set karo.
+2. Kuch aur setup nahi chahiye (API key nahi lagti).
 3. `run.bat` double-click karo. Mac/Linux: `bash run.sh`.
 
 ---
@@ -28,8 +28,6 @@ Card ki **live photo** lo ya images **upload** karo (front + back). App saari de
 3. **Language/Runtime: Docker** rakho (repo me `Dockerfile` already hai, port Render ke `PORT` se khud set ho jata hai).
 4. **Environment Variables** me ye daalo:
    ```
-   GEMINI_API_KEY = AIza...
-   GROQ_API_KEY   = gsk_...        (free backup, neeche dekho)
    APP_PASSWORD   = koi-strong-password
    ```
 5. (Optional) Settings me **Health Check Path** `/_stcore/health` rakh do.
@@ -37,20 +35,12 @@ Card ki **live photo** lo ya images **upload** karo (front + back). App saari de
 
 ---
 
-## Free limit khatam ho jaye to (Gemini + Groq backup)
-- **Groq** ki free key console.groq.com/keys se milti hai (card/billing nahi lagti). Isse `GROQ_API_KEY` naam se Render env me daal do.
-- Dono keys hon to app pehle Gemini use karta hai. Gemini ki limit khatam ho (ya wo fail ho) to **apne aap Groq** se card read hota hai, aur kuch der Gemini ko chhod deta hai. Aapko kuch karna nahi padta.
-- Sirf Groq key ho (Gemini ki na ho) tab bhi app chalta hai.
-- Groq ka model `meta-llama/llama-4-scout-17b-16e-instruct` hai (vision wala). Badalna ho to `GROQ_MODEL` env set karo. Groq ki free limits console.groq.com par dekh lo.
-- Groq par bhi free tier me Google ki tarah privacy guarantee nahi hoti, to sensitive data ke liye dhyan rakho.
-
 ## Zaroori baatein
-- **Password zaroor set karo.** Bina password ke link jiske paas hoga wo aapki API key ka free quota khatam kar dega.
-- Free tier me requests/minute aur requests/day ki limit hoti hai. Sirf ek key ho to app rate-limit (429) par khud retry karta hai (bade batch thode dheere chalenge); dono keys hon to seedha doosre par chala jata hai.
-- Free tier me Google aapka data apne products sudharne ke liye use kar sakta hai. Cards me logon ke phone/email hote hain, to sensitive/client data ke liye paid key use karna better hai.
-- Model: app `gemini-3.8-flash` use karta hai, aur agar Google koi model band kar de (404) to khud agla (`gemini-3.5-flash`, `gemini-3.1-flash-lite`) try kar leta hai. Apna model chahiye to Render env me `GEMINI_MODEL = model-name` set karo (kai ho to comma se alag karo).
-- Phone par hamesha **📱 Phone scan** tab use karo: ye phone ka original camera kholta hai, quality sabse achhi aati hai.
-- "Browser camera" sirf **HTTPS** (deployed link) ya localhost par chalta hai. Mobile par ye ab apne aap **back camera** kholta hai (laptop par jo ek webcam hai wahi chalega).
-- **Render free plan:** 15 minute koi traffic na aaye to service sleep ho jati hai, aur dobara kholne par ek minute tak lag sakta hai. Event se pehle ek baar kholke jaga lo. Free service restart/sleep hone par server ki memory aur files dono jaati hain, to sab cards/Excel chale jayenge.
-- Photo ke saath sirf card ki details Gemini API ko jaati hain; app khud kuch store nahi karta. Cards aur Excel server ki memory me is session tak rehte hain. Tab refresh/band karne ya Render ke sleep/restart par chale jate hain. Isliye beech-beech me Export Excel karte raho. Export dabane par sirf wahi cards aayenge jo tab tak read ho chuke hain.
+- Ab koi API key nahi chahiye. Sab kuch server/computer par hi hota hai, card ka data kahin bahar nahi jata.
+- OCR rule-based hai, to **table check karke edit zaroor karo**, khaaskar Name/Company/Address. Photo saaf, seedhi aur achhi roshni me lo to accuracy best aati hai.
+- Abhi English/Latin text padhta hai. Hindi ke liye alag OCR model lagana padega.
+- Password zaroor set karo (`APP_PASSWORD`) agar link public hai.
+- Render free plan (512MB RAM) me chalta hai; `WORKERS` app.py me 2 hai, RAM kam pade to 1 kar do. Pehla card load hone me kuch second lagte hain (OCR model load).
+- Phone par **📱 Phone scan** tab use karo (original camera, best quality). "Browser camera" sirf HTTPS ya localhost par chalta hai.
+- Cards/Excel server memory me rehte hain; refresh/restart par chale jate hain, to beech-beech me Export Excel karte raho.
 - Columns badalne ho to `app.py` ke upar `HEADERS` edit karo.
