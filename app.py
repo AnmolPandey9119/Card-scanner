@@ -20,12 +20,12 @@ import streamlit as st
 import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 
-from ocr_engine import read_card
+from ocr_engine import read_card, warmup
 
-MAX_SIDE = 1600   # photos are shrunk to this before being stored / sent
+MAX_SIDE = 1280   # photos are shrunk to this before being stored / sent
 MAX_PENDING = 60  # max cards being read at the same time
 WORKERS = 2       # cards read in parallel (OCR is CPU heavy; keep low on small servers)
-REFRESH_SECS = 2  # live status refresh while cards are being read
+REFRESH_SECS = 1  # live status refresh while cards are being read
 EXTS = ["jpg", "jpeg", "png", "webp"]
 
 HEADERS = [
@@ -499,6 +499,7 @@ def results_panel():
 
 
 def main():
+    warmup()   # load OCR model in background while the page renders
     st.set_page_config(page_title="Visiting Card Scanner", page_icon="📇", layout="wide")
     st.markdown(STYLE, unsafe_allow_html=True)
     password_gate()

@@ -9,7 +9,7 @@ from PIL import Image
 
 _engine = None
 _engine_lock = threading.Lock()
-_run_lock = threading.Lock()   # onnxruntime session is shared; run one image at a time
+DET_MAX_SIDE = 960   # smaller = faster detection; cards have big enough text for this
 
 
 def _get_engine():
@@ -17,16 +17,18 @@ def _get_engine():
     with _engine_lock:
         if _engine is None:
             from rapidocr_onnxruntime import RapidOCR
-            _engine = RapidOCR()
+            _engine = RapidOCR(det_model_path=None, det_limit_type="max", det_limit_side_len=DET_MAX_SIDE)
+            _engine(np.zeros((320, 320, 3), dtype=np.uint8))   # warm-up so the first real card is fast
         return _engine
 
 
-def ocr_lines(jpeg_bytes: bytes) -> list:
-    """Return text lines top-to-bottom: [{"text", "h", "y"}] (h = text height, used for font size)."""
-    img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
-    arr = np.array(img)[:, :, ::-1]   # RGB -> BGR
-    with _run_lock:
-        result, _ = _get_engine()(arr)
+def warmup():
+    """Load the OCR model in the background (call once at app start)."""
+    threading.Thread(target=_get_engine, daemon=True).start()
+
+
+def _run(arr):
+    result, _ = _get_engine()(arr)   # onnxruntime sessions are thread-safe
     items = []
     for box, text, conf in (result or []):
         text = str(text).strip()
@@ -34,7 +36,35 @@ def ocr_lines(jpeg_bytes: bytes) -> list:
             continue
         ys = [p[1] for p in box]
         xs = [p[0] for p in box]
-        items.append({"text": text, "x": min(xs), "y": min(ys), "h": max(ys) - min(ys), "yc": sum(ys) / 4})
+        items.append({"text": text, "x": min(xs), "y": min(ys), "h": max(ys) - min(ys),
+                      "w": max(xs) - min(xs), "yc": sum(ys) / 4})
+    return items
+
+
+def _score(items):
+    """Rough quality: number of characters read (used to pick the best rotation)."""
+    return sum(len(i["text"]) for i in items)
+
+
+def _flatness(items):
+    if not items:
+        return 0
+    r = sorted(i["w"] / max(i["h"], 1) for i in items)
+    return r[len(r) // 2]
+
+
+def ocr_lines(jpeg_bytes: bytes) -> list:
+    """Return text lines top-to-bottom: [{"text", "h", "y"}] (h = text height, used for font size)."""
+    img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
+    arr = np.array(img)[:, :, ::-1]   # RGB -> BGR
+    items = _run(arr)
+    portrait = arr.shape[0] > arr.shape[1] * 1.15   # cards are usually landscape -> may be sideways
+    if portrait or _score(items) < 25:   # try 90 / 270 degrees as well
+        cands = [items] + [_run(np.ascontiguousarray(np.rot90(arr, k))) for k in (1, 3)]
+        top = max(_score(c) for c in cands)
+        good = [c for c in cands if _score(c) >= 0.8 * top]
+        # upright text has wide, flat boxes: pick the candidate with the flattest boxes
+        items = max(good, key=_flatness)
     # group boxes that sit on the same visual line (left-to-right), then order top-to-bottom
     items.sort(key=lambda d: d["yc"])
     lines, cur = [], []
