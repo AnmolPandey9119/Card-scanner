@@ -31,13 +31,27 @@ FIELDS = ["Name", "Designation", "Company", "Mobile", "Phone / Landline", "Email
           "City", "State", "Pincode", "Country", "LinkedIn / Social", "Services / Products", "Other Notes"]
 
 PROMPT = (
-    "You read Indian/International business cards. Image 1 is the FRONT, image 2 (if present) is the BACK. "
-    "Return ONLY a JSON object with exactly these string keys: " + ", ".join(f'"{f}"' for f in FIELDS) + ". "
-    "Rules: Mobile = mobile numbers (10 digit Indian numbers as +91 XXXXXXXXXX); Phone / Landline = landlines/fax; "
-    "multiple values separated by '; '. Address = full street address WITHOUT city/state/pincode repeated "
-    "separately only if clearly distinct, otherwise full address. Services / Products = what the business offers. "
-    "Other Notes = GST number and anything that fits nowhere else. Use \"\" for anything not on the card. "
-    "Never invent data."
+    "You are an expert data-entry operator reading Indian/International business cards. "
+    "Image 1 is the FRONT, image 2 (if present) is the BACK. Return ONLY a JSON object with exactly these string keys: "
+    + ", ".join(f'"{f}"' for f in FIELDS) + ".\n"
+    "Read the card like a human would and put every value in ONE correct column only:\n"
+    "- Name = the person's name only (keep Mr./Dr. if printed). Never a company, never a designation.\n"
+    "- Designation = ONLY the job title of that person (e.g. 'Sales Manager', 'Director - Exports'). It must NOT contain the "
+    "company name, city, phone or department-of-company text. If the title and company are on one line, split them.\n"
+    "- Company = ONLY the organisation's name (e.g. 'Sharma Traders Pvt. Ltd.'). It must NOT contain the person's designation, "
+    "city, state, pincode or tagline. Taglines / 'Since 1998' / 'Manufacturers of ...' go to Services / Products or Other Notes.\n"
+    "- Address = street/area/building/sector part of the address, as printed. City, State, Pincode, Country each go in their own "
+    "column; City is ONLY the city/town name (e.g. 'Noida', not 'Noida - 201301' and not part of Company).\n"
+    "- Mobile = mobile numbers (Indian 10-digit as '+91 XXXXXXXXXX'); Phone / Landline = landline/office numbers, with STD code; "
+    "a fax number is written as '<number> (Fax)' in Phone / Landline. Several values are separated by '; '.\n"
+    "- Email = email addresses only; Website = website only; LinkedIn / Social = social profile links only.\n"
+    "- Services / Products = what the business makes or offers. Other Notes = GST number, CIN and anything that fits nowhere else.\n"
+    "Rules: use \"\" for anything NOT printed on the card (never guess or invent, never infer a city from the company name). "
+    "Use the front and back together: if the back repeats the same details, do not duplicate them. "
+    "Fix obvious OCR-style slips only when the text is unambiguous (e.g. 'rajesh(a)xyz.com' -> 'rajesh@xyz.com').\n"
+    "Example: card text 'Rajesh Kumar / Sales Manager / ABC Enterprises Pvt Ltd / Plot 5, Sector 62, Noida - 201301 (U.P.)' -> "
+    "Name 'Rajesh Kumar', Designation 'Sales Manager', Company 'ABC Enterprises Pvt Ltd', Address 'Plot 5, Sector 62', "
+    "City 'Noida', State 'Uttar Pradesh', Pincode '201301'."
 )
 
 

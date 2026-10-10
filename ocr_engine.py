@@ -165,6 +165,21 @@ STRONG_COMPANY_RE = re.compile(r"\b(?:pvt|private|ltd|limited|llp|llc|inc|corp|c
                                r"industries|traders?|trading|associates|group|exports?|imports?)\b", re.I)
 STRONG_ADDR_RE = re.compile(r"\b(?:road|rd|street|nagar|colony|sector|plot|floor|building|bldg|tower|complex|lane|marg|"
                             r"chowk|near|opp|opposite|behind|phase|block|village|district|po)\b", re.I)
+LEGAL_RE = re.compile(r"\b(?:pvt|private|ltd|limited|llp|llc|inc|corp|corporation|co|enterprises?|industries|"
+                      r"traders?|associates|sons|brothers|bros)\b", re.I)
+ROLE_RE = re.compile(r"\b(?:manager|director|head|executive|officer|engineer|secretary|incharge|in-charge|analyst|"
+                     r"consultant|partner|chairman|chairperson|president|founder|co-?founder|owner|proprietor|"
+                     r"proprietress|ceo|cfo|cto|coo|md|gm|agm|vp|supervisor|coordinator|specialist|administrator|"
+                     r"representative|advisor|adviser|architect|designer|developer|trainee|intern|assistant)\b", re.I)
+
+
+def _company_like(t: str) -> bool:
+    """True for 'Sharma Traders Pvt Ltd'; False for 'Export Manager' / 'Company Secretary'."""
+    if LEGAL_RE.search(t) and not (ROLE_RE.search(t) and not re.search(r"\b(?:pvt|private|ltd|limited|llp|llc)\b", t, re.I)):
+        return True
+    return bool(STRONG_COMPANY_RE.search(t)) and not ROLE_RE.search(t)
+
+
 SPLIT_RE = re.compile(r"\s{2,}|\s[|/\u2022\u2013\u2014]\s|\s-\s")
 LABEL_RE = re.compile(r"^\s*(?:e-?mail|email|mail|web(?:site)?|url|tel(?:ephone)?|ph(?:one)?|mob(?:ile)?|cell|"
                       r"fax|whats\s?app|office|res|contact|call|m|t|p|e|w|f)\s*[:.\-|/]+\s*", re.I)
@@ -310,7 +325,7 @@ def parse_card(front_lines: list, back_lines: list) -> dict:
         new = []
         for l in leftovers[side]:
             parts = [p.strip() for p in SPLIT_RE.split(l["text"]) if p.strip()]
-            flags = [bool(DESIG_RE.search(p)) and not STRONG_COMPANY_RE.search(p) for p in parts]
+            flags = [bool(DESIG_RE.search(p)) and not _company_like(p) for p in parts]
             if len(parts) >= 2 and 0 < sum(flags) < len(parts) and not PIN_RE.search(l["text"]):
                 new += [{**l, "text": p} for p in parts]
             else:
@@ -326,7 +341,7 @@ def parse_card(front_lines: list, back_lines: list) -> dict:
     # designation first (so words like "Marketing" / "Main" do not push it into company / address)
     for i, (s, l) in enumerate(all_left):
         t = l["text"]
-        if (DESIG_RE.search(t) and not re.search(r"\d", t) and not STRONG_COMPANY_RE.search(t)
+        if (DESIG_RE.search(t) and not re.search(r"\d", t) and not _company_like(t)
                 and not STRONG_ADDR_RE.search(t) and len(t) < 60 and len(out["Designation"]) < 2):
             add("Designation", t)
             take(i)
@@ -389,7 +404,7 @@ def parse_card(front_lines: list, back_lines: list) -> dict:
 
     # designation (second chance: lines that mention company-like words but are short)
     for i, (s, l) in enumerate(all_left):
-        if i not in used and DESIG_RE.search(l["text"]) and not STRONG_COMPANY_RE.search(l["text"]) and len(l["text"]) < 60:
+        if i not in used and DESIG_RE.search(l["text"]) and not _company_like(l["text"]) and len(l["text"]) < 60:
             add("Designation", l["text"])
             take(i)
             if len(out["Designation"]) >= 2:
@@ -397,6 +412,7 @@ def parse_card(front_lines: list, back_lines: list) -> dict:
 
     # company: keyword match, otherwise the biggest-font line on the front
     comp = [i for i, (s, l) in enumerate(all_left) if i not in used and COMPANY_RE.search(l["text"]) and len(l["text"]) < 70]
+    comp.sort(key=lambda i: (not _company_like(all_left[i][1]["text"]), i))   # real companies first, keep card order
     if comp:
         i = comp[0]
         add("Company", all_left[i][1]["text"])
@@ -432,7 +448,7 @@ def parse_card(front_lines: list, back_lines: list) -> dict:
             if 0 <= j < len(all_left) and j not in used and all_left[j][0] == "front":
                 t = all_left[j][1]["text"]
                 if (re.fullmatch(r"[A-Za-z&.,/\- ]{3,40}", t) and len(t.split()) <= 5
-                        and not STRONG_COMPANY_RE.search(t) and not STRONG_ADDR_RE.search(t)
+                        and not _company_like(t) and not STRONG_ADDR_RE.search(t)
                         and all_left[j][1]["h"] <= all_left[ni][1]["h"] * 1.15):
                     add("Designation", t)
                     take(j)
@@ -457,6 +473,126 @@ def parse_card(front_lines: list, back_lines: list) -> dict:
     row = {k: "; ".join(v) for k, v in out.items()}
     row["Address"] = out["Address"][0] if out["Address"] else ""
     return row
+
+
+# ------------------------- cross-field clean-up (used for OCR *and* Gemini output) -------------------------
+CITIES = """Delhi|New Delhi|Noida|Greater Noida|Gurgaon|Gurugram|Ghaziabad|Faridabad|Mumbai|Navi Mumbai|Thane|Pune|
+Bengaluru|Bangalore|Chennai|Hyderabad|Secunderabad|Kolkata|Ahmedabad|Surat|Vadodara|Rajkot|Jaipur|Jodhpur|Udaipur|
+Kota|Lucknow|Kanpur|Agra|Varanasi|Allahabad|Prayagraj|Meerut|Bareilly|Moradabad|Aligarh|Mathura|Gorakhpur|Jhansi|
+Saharanpur|Muzaffarnagar|Bulandshahr|Hapur|Sahibabad|Dehradun|Haridwar|Roorkee|Chandigarh|Mohali|Panchkula|
+Ludhiana|Amritsar|Jalandhar|Patiala|Bhopal|Indore|Gwalior|Jabalpur|Nagpur|Nashik|Aurangabad|Kolhapur|Solapur|
+Patna|Ranchi|Jamshedpur|Dhanbad|Bhubaneswar|Cuttack|Guwahati|Raipur|Bhilai|Visakhapatnam|Vijayawada|Guntur|
+Tirupati|Coimbatore|Madurai|Tiruppur|Salem|Trichy|Tiruchirappalli|Kochi|Cochin|Thiruvananthapuram|Trivandrum|
+Kozhikode|Mysore|Mysuru|Mangalore|Hubli|Belgaum|Panipat|Sonipat|Rohtak|Ambala|Karnal|Hisar|Bhiwadi|Jammu|
+Srinagar|Shimla|Panaji|Vapi|Silvassa|Siliguri|Howrah|Durgapur|Dubai|Abu Dhabi|Sharjah|Singapore|Kathmandu|Dhaka""".replace("\n", "").split("|")
+_CITY_ALT = "|".join(re.escape(c.strip()) for c in sorted(set(CITIES), key=len, reverse=True) if c.strip())
+CITY_TAIL_RE = re.compile(rf"[\s,|\-\u2013/]*\b({_CITY_ALT})\b(?:[\s,\-\u2013]*[1-9]\d{{2}}\s?\d{{3}})?\s*$", re.I)
+CITY_ONLY_RE = re.compile(rf"^\s*({_CITY_ALT})\b[\s,\-\u2013]*(?:[1-9]\d{{2}}\s?\d{{3}})?\s*$", re.I)
+_SEP_RE = re.compile(r"\s*[|\u2022\u2013\u2014/,]\s*|\s+-\s+|\s{2,}")
+_STOP_END = {"of", "and", "&", "the", "in", "for", "at", "to"}
+
+
+def _parts(t):
+    return [p.strip(" .-") for p in _SEP_RE.split(t) if p.strip(" .-")]
+
+
+def _cut_role(text, min_head):
+    """'Sales Manager ABC Enterprises' -> ('Sales Manager', 'ABC Enterprises'); no cut -> (text, '')."""
+    toks = text.split()
+    last = max((i for i, tk in enumerate(toks) if ROLE_RE.fullmatch(tk.strip(".,;:()"))), default=-1)
+    if last < 0 or last + 1 >= len(toks) or last + 1 < min_head:
+        return text, ""
+    head, tail = " ".join(toks[: last + 1]), " ".join(toks[last + 1:]).lstrip("-|,:& ").strip()
+    if tail and _company_like(tail):
+        return head, tail
+    return text, ""
+
+
+def _is_geo(p):
+    q = PIN_RE.sub("", p).strip(" -,.")
+    if not q:
+        return "pin"
+    m = CITY_ONLY_RE.match(q)
+    if m:
+        return "city:" + m.group(1)
+    if any(re.fullmatch(re.escape(s), q, re.I) for s in STATES):
+        return "state"
+    return None
+
+
+def reconcile_row(row: dict) -> dict:
+    """Fix the classic mix-ups so each value ends up in its own column:
+       - company name that carries the city / state / pincode      -> city moved to City
+       - designation that carries the company ('Sales Manager ABC Pvt Ltd') -> company moved to Company
+       - company that starts with a designation                    -> designation moved to Designation
+       - City empty but the address clearly names one              -> City filled; City cleaned of state/pin"""
+    r = {k: (str(v).strip() if v is not None else "") for k, v in row.items()}
+    comp, desig, city = r.get("Company", ""), r.get("Designation", ""), r.get("City", "")
+
+    # ---- designation: remove a company that got glued to it ----
+    # a "company" that is really just a city (the card's last line) must not block the real company
+    g0 = _is_geo(comp) if comp else None
+    if g0 and g0.startswith("city:"):
+        city, comp = city or g0[5:], ""
+
+    moved_comp, fixed = "", []
+    for part in [p.strip() for p in desig.split(";") if p.strip()]:
+        kept, changed = [], False
+        for sg in _parts(part):
+            h, t = _cut_role(sg, 1)
+            if t:                                  # 'Sales Manager ABC Pvt Ltd'
+                moved_comp, changed = moved_comp or t, True
+                kept.append(h)
+            elif _company_like(sg) and not ROLE_RE.search(sg):   # 'Director | Sharma Traders'
+                moved_comp, changed = moved_comp or sg, True
+            else:
+                kept.append(sg)
+        fixed.append(", ".join(kept) if changed else part)
+    desig = "; ".join(x for x in fixed if x)
+    if moved_comp and not comp:
+        comp = moved_comp
+
+    # ---- company: remove designation head, city, state, pincode ----
+    if comp:
+        h, t = _cut_role(comp, 2)
+        if t:
+            comp = t
+            desig = desig or h
+        keep = []
+        parts = _parts(comp)
+        for p in parts:
+            g = _is_geo(p)
+            if g and len(parts) > 1:
+                if g.startswith("city:") and not city:
+                    city = g[5:]
+                continue
+            keep.append(p)
+        joined = " ".join(keep) if len(keep) != len(parts) else comp
+        m = CITY_TAIL_RE.search(joined)
+        if m:
+            rem = joined[: m.start()].strip(" ,|-\u2013/")
+            words = rem.split()
+            if len(words) >= 2 and words[-1].lower() not in _STOP_END:
+                city = city or m.group(1)
+                joined = rem
+        comp = joined.strip()
+
+    # ---- city: clean + fill from the address if empty ----
+    if city:
+        city = PIN_RE.sub("", city)
+        for s in sorted(STATES, key=len, reverse=True):
+            city = re.sub(rf"(?i)[\s,\-]*\b{re.escape(s)}\b", "", city)
+        city = city.strip(" ,-.")
+        city = city.title() if city.isupper() else city
+    if not city and r.get("Address"):
+        for p in reversed(re.split(r"[,\n]", r["Address"])):
+            g = _is_geo(p.strip())
+            if g and g.startswith("city:"):
+                city = g[5:].title() if g[5:].isupper() else g[5:]
+                break
+
+    r.update(Company=comp, Designation=desig, City=city)
+    return r
 
 
 def read_card(front_jpeg, back_jpeg) -> dict:
