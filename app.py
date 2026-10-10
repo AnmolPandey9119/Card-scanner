@@ -109,37 +109,69 @@ REAR_CAMERA_JS = """
 
 STYLE = """
 <style>
-div.stButton > button, div.stDownloadButton > button {
+[data-testid="stElementContainer"]:has(> [data-testid="stButton"]),
+[data-testid="stElementContainer"]:has(> [data-testid="stDownloadButton"]),
+[data-testid="stButton"], [data-testid="stDownloadButton"] { width: 100% !important; }
+[data-testid="stButton"] button, [data-testid="stDownloadButton"] button {
     width: 100%; min-height: 3rem; font-size: 1.05rem; border-radius: 10px;
 }
 button { touch-action: manipulation; }   /* no double-tap-zoom delay -> fast repeated taps */
-
-/* Browser camera: big "Take Photo" bar so cards can be shot quickly */
-[data-testid="stCameraInputButton"] {
-    min-height: 5rem !important;
-    background: #1F4E78 !important;
-    border-radius: 0 0 10px 10px;
-}
-[data-testid="stCameraInputButton"], [data-testid="stCameraInputButton"] * {
-    font-size: 1.5rem !important; font-weight: 700 !important; color: #fff !important;
-}
-
 footer {visibility: hidden;}
+
+/* Front / back slots stay SIDE BY SIDE, also on a phone */
+div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: 0.6rem !important; }
+div[data-testid="stHorizontalBlock"] > div { min-width: 0 !important; flex: 1 1 0 !important; }
+[data-testid="stImage"] img { max-height: 38vh; object-fit: contain; border-radius: 8px; border: 1px solid #d0d7de; }
+
+/* ---------- Browser camera: FULL SCREEN with a big capture bar ---------- */
+.st-key-camfs {
+    position: fixed !important; inset: 0 !important; z-index: 1000000 !important;
+    background: #000; padding: 0 !important; margin: 0 !important; gap: 0 !important;
+    display: flex; flex-direction: column; width: 100vw !important; height: 100vh !important; height: 100dvh !important;
+    max-width: none !important; overflow: hidden;
+}
+.st-key-camfs [data-testid="stCameraInput"] {
+    flex: 1 1 auto; display: flex; flex-direction: column; width: 100% !important; min-height: 0; margin: 0;
+}
+.st-key-camfs [data-testid="stCameraInput"],
+.st-key-camfs [data-testid="stCameraInputWebcamComponent"],
+.st-key-camfs [data-testid="stCameraInputWebcamStyledBox"] {   /* Streamlit pins these to a 16:9 box */
+    height: calc(100vh - 5.5rem) !important; height: calc(100dvh - 5.5rem) !important; aspect-ratio: auto !important;
+}
+.st-key-camfs video, .st-key-camfs [data-testid="stCameraInput"] img {
+    width: 100% !important; height: calc(100vh - 5.5rem) !important; height: calc(100dvh - 5.5rem) !important;
+    object-fit: cover; border-radius: 0 !important;
+}
+.st-key-camfs [data-testid="stCameraInputButton"] {
+    position: fixed !important; left: 0; right: 0; bottom: 0; z-index: 1000001;
+    min-height: 5.5rem !important; border-radius: 0 !important; border: 0 !important;
+    background: #1F4E78 !important; justify-content: center;
+}
+.st-key-camfs [data-testid="stCameraInputButton"], .st-key-camfs [data-testid="stCameraInputButton"] * {
+    font-size: 1.6rem !important; font-weight: 700 !important; color: #fff !important;
+}
+.st-key-camfs .cam-banner {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 1000001; padding: 0.9rem 5.5rem 0.9rem 1rem;
+    color: #fff; font-size: 1.15rem; background: linear-gradient(#000c, #0000);
+}
+.st-key-cam_close { position: fixed !important; top: 0.5rem; right: 0.6rem; z-index: 1000002; width: auto !important; }
+div.st-key-cam_close[data-testid="stElementContainer"]:has(> [data-testid="stButton"]) {
+    width: auto !important; left: auto !important; right: 0.6rem !important; top: 0.5rem !important;
+}
+.st-key-cam_close [data-testid="stButton"] { width: auto !important; }
+.st-key-cam_close button { min-height: 2.6rem; width: auto !important; padding: 0 1rem; background: #000a; color: #fff; border: 1px solid #fff8; }
+
 @media (max-width: 640px) {
     .block-container {padding: 1rem 0.8rem 5rem 0.8rem;}
     h1 {font-size: 1.7rem !important;}
-    /* bigger buttons for Next / Save / Skip on phones */
-    div.stButton > button, div.stDownloadButton > button {min-height: 3.6rem; font-size: 1.2rem;}
-    [data-testid="stCameraInputButton"] {min-height: 7rem !important;}
-    [data-testid="stCameraInputButton"], [data-testid="stCameraInputButton"] * {font-size: 1.8rem !important;}
-    /* Phone scan / upload: one huge tap area instead of a small "Browse files" button */
+    [data-testid="stButton"] button, [data-testid="stDownloadButton"] button {min-height: 3.4rem; font-size: 1.1rem;}
+    /* Phone scan: one huge tap area per side instead of a small "Browse files" button */
     [data-testid="stFileUploaderDropzone"] {
-        min-height: 9rem; justify-content: center; border-radius: 12px;
-        padding: 0.5rem;
+        min-height: 7rem; justify-content: center; border-radius: 12px; padding: 0.4rem;
     }
     [data-testid="stFileUploaderDropzoneInstructions"] {display: none;}
     [data-testid="stFileUploaderDropzone"] button {
-        width: 100%; min-height: 6rem; font-size: 1.5rem; font-weight: 700;
+        width: 100%; min-height: 5.5rem; font-size: 1.1rem; font-weight: 700;
         background: #1F4E78; color: #fff; border-radius: 12px;
     }
 }
@@ -418,11 +450,12 @@ def to_excel(df: pd.DataFrame) -> bytes:
 def init_state():
     ss = st.session_state
     ss.setdefault("store", CardStore())
-    for mode in ("phone", "cam"):   # one card-by-card flow per tab
-        ss.setdefault(f"{mode}_n", 0)            # bumping it resets that tab's widgets
-        ss.setdefault(f"{mode}_step", "front")
-        ss.setdefault(f"{mode}_front", None)
-    ss.setdefault("up_n", 0)        # resets the bulk-upload widgets after "add"
+    ss.setdefault("phone_n", 0)      # bumping it resets the phone-scan uploaders after "Save"
+    ss.setdefault("cam_front", None)  # raw bytes of the browser-camera shots for the card in progress
+    ss.setdefault("cam_back", None)
+    ss.setdefault("cam_open", None)   # None | "front" | "back": which side the full-screen camera is for
+    ss.setdefault("cam_k", 0)         # bumping it gives the camera widget a fresh start
+    ss.setdefault("up_n", 0)          # resets the bulk-upload widgets after "add"
     ss.setdefault("editor_ver", 0)
     ss.setdefault("was_pending", False)
 
@@ -455,52 +488,70 @@ def password_gate():
     st.stop()
 
 
-def scan_flow(mode: str):
-    """Card-by-card flow: front -> back -> save (reading starts as soon as you save).
-    mode 'phone': phone's own camera app via the file picker (rear camera, full quality).
-    mode 'cam'  : in-browser camera widget."""
+SIDE_LABEL = {"front": "FRONT", "back": "BACK"}
+
+
+def camera_overlay():
+    """Full-screen camera (CSS .st-key-camfs). Capture -> stored -> opens BACK automatically, or closes."""
     ss = st.session_state
-    n, step = ss[f"{mode}_n"], ss[f"{mode}_step"]
-    side = "FRONT" if step == "front" else "BACK"
-    st.markdown(f"**Card #{ss.store.next_id} · {side} side**")
+    side = ss.cam_open
+    with st.container(key="camfs"):
+        st.markdown(f"<div class='cam-banner'>Card #{ss.store.next_id} · <b>{SIDE_LABEL[side]}</b> side</div>",
+                    unsafe_allow_html=True)
+        if st.button("⏭ Back nahi hai" if side == "back" else "✕ Band karo", key="cam_close"):
+            ss.cam_open = None
+            ss.cam_k += 1
+            st.rerun()
+        shot = st.camera_input("camera", key=f"cam_in_{ss.cam_k}", label_visibility="collapsed")
+    if shot is not None:
+        ss[f"cam_{side}"] = shot.getvalue()
+        ss.cam_open = "back" if (side == "front" and not ss.cam_back) else None
+        ss.cam_k += 1
+        st.rerun()
 
+
+def scan_flow(mode: str):
+    """One card = FRONT and BACK slots side by side (back optional) + one Save button.
+    mode 'phone': phone's own camera app via the file picker (rear camera, full quality).
+    mode 'cam'  : full-screen in-browser camera; back side opens right after the front."""
+    ss = st.session_state
+    if mode == "cam" and ss.cam_open:
+        camera_overlay()
+    st.markdown(f"**Card #{ss.store.next_id}** · front aur back ek saath lo, phir ek baar Save")
     if mode == "phone":
-        st.caption("Neeche tap karo → **Take Photo** chuno → card ki photo lo.")
-        shot = st.file_uploader(f"{step} photo", type=EXTS, key=f"phone_{n}_{step}", label_visibility="collapsed")
+        st.caption("Dono side ke box me **Upload** dabao → **Camera / Take Photo** chuno. Back optional hai, order koi bhi chalega.")
     else:
-        st.caption("Card ko seedha, achhi roshni me, poora frame me rakho. Camera allow karna.")
-        shot = st.camera_input(f"{step} photo", key=f"cam_{n}_{step}", label_visibility="collapsed")
+        st.caption("Camera full screen khulega. Front lete hi back ka camera khud khul jayega.")
 
-    def save_card(back_bytes):
+    shots = {}
+    for col, side in zip(st.columns(2, gap="small"), ("front", "back")):
+        with col:
+            st.markdown(f"**{SIDE_LABEL[side]}**" + (" · optional" if side == "back" else ""))
+            if mode == "phone":
+                f = st.file_uploader(f"{side} photo", type=EXTS, key=f"phone_{ss.phone_n}_{side}",
+                                     label_visibility="collapsed")
+                shots[side] = f.getvalue() if f else None
+            else:
+                shots[side] = ss[f"cam_{side}"]
+                if st.button(("🔄 Retake" if shots[side] else "📷 Take") + f" {side}", key=f"cam_btn_{side}"):
+                    ss.cam_open = side
+                    ss.cam_k += 1
+                    st.rerun()
+            if shots[side]:
+                st.image(shots[side])
+
+    if st.button("✅ Save card", type="primary", disabled=not shots["front"], key=f"{mode}_save"):
         base = f"card_{ss.store.next_id:03d}"
-        back = (f"{base}_back.jpg", back_bytes) if back_bytes else None
-        front = (f"{base}_front.jpg", ss[f"{mode}_front"])
-        if submit_card(front, back):
-            ss[f"{mode}_n"] += 1
-            ss[f"{mode}_step"], ss[f"{mode}_front"] = "front", None
+        front = (f"{base}_front.jpg", shots["front"])
+        back = (f"{base}_back.jpg", shots["back"]) if shots["back"] else None
+        if submit_card(front, back, raw=True):   # shrinking happens in the background worker
+            if mode == "phone":
+                ss.phone_n += 1
+            else:
+                ss.cam_front = ss.cam_back = None
             st.rerun()
-
-    if step == "front":
-        if shot:
-            st.image(shot.getvalue(), width=200)
-            if st.button("➡️ Next: back side", type="primary", key=f"{mode}_next_{n}"):
-                ss[f"{mode}_front"] = compress_image(shot.getvalue())
-                ss[f"{mode}_step"] = "back"
-                st.rerun()
-            if st.button("✅ Save (no back side)", key=f"{mode}_nob_{n}"):
-                ss[f"{mode}_front"] = compress_image(shot.getvalue())
-                save_card(None)
-    else:
-        st.image(ss[f"{mode}_front"], caption="Front saved", width=140)
-        if shot:
-            st.image(shot.getvalue(), width=200)
-            if st.button("✅ Save card", type="primary", key=f"{mode}_save_{n}"):
-                save_card(compress_image(shot.getvalue()))
-        if st.button("⏭️ Skip back & save", key=f"{mode}_skip_{n}"):
-            save_card(None)
-        if st.button("↩️ Retake front", key=f"{mode}_retake_{n}"):
-            ss[f"{mode}_step"], ss[f"{mode}_front"] = "front", None
-            st.rerun()
+    if not shots["front"]:
+        st.caption("Save tab hoga jab front side aa jayegi.")
 
 
 def upload_tab():
