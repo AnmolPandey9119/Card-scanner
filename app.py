@@ -4,13 +4,13 @@ Every card is read in the background the moment you add it and its row goes
 straight into the Excel, so "Export Excel" is instant.
 Run locally:  streamlit run app.py
 """
-import base64
 import hmac
+import html
 import inspect
 import io
-import json
 import os
 import re
+import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -31,6 +31,11 @@ EXTS = ["jpg", "jpeg", "png", "webp"]
 # Browser camera: by default Streamlit takes the photo at the on-screen size (~400px wide on a phone = too blurry to read).
 # Newer Streamlit can ask the camera for 1080p; older versions simply skip this option.
 CAM_KW = {"resolution": "1080p"} if "resolution" in inspect.signature(st.camera_input).parameters else {}
+
+# Newer Streamlit: the Excel is built only when "Export" is clicked and the click does not re-run the page.
+_DL_PARAMS = inspect.signature(st.download_button).parameters
+DL_LAZY = "on_click" in _DL_PARAMS and "ignore" in str(_DL_PARAMS["on_click"].annotation)
+STORE_TTL = 12 * 3600   # a session's cards stay on the server this long after its last visit (survives page refresh)
 
 HEADERS = [
     "Name",
@@ -112,19 +117,86 @@ REAR_CAMERA_JS = """
 
 STYLE = """
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+:root {
+  --brand:#1F4E78; --brand2:#2F80D1; --ink:#0F172A; --muted:#64748B; --line:#E2E8F0; --soft:#EEF4FB;
+  --ok:#12B76A; --busy:#2F80D1; --warn:#F79009; --bad:#F04438;
+}
+.stApp, .stApp button, .stApp input, .stApp textarea, [data-testid="stMarkdownContainer"],
+[data-testid="stCaptionContainer"], .hero, .stat, .empty, .note {
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+.block-container { padding-top: 1.1rem; padding-bottom: 5rem; max-width: 1500px; }
+footer, #MainMenu { visibility: hidden; }
+button { touch-action: manipulation; }   /* no double-tap-zoom delay -> fast repeated taps */
+
+/* ---------- hero ---------- */
+.hero { position: relative; overflow: hidden; display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+  padding: 1.1rem 1.3rem; margin-bottom: 1rem; border-radius: 18px; color: #fff;
+  background: linear-gradient(120deg, #0E3A66 0%, #1F6FB2 58%, #2F9BD6 100%); box-shadow: 0 10px 28px rgba(31,78,120,.25); }
+.hero::after { content: ""; position: absolute; right: -70px; top: -80px; width: 240px; height: 240px; border-radius: 50%; background: rgba(255,255,255,.08); }
+.hero-left { display: flex; align-items: center; gap: .9rem; min-width: 0; position: relative; z-index: 1; }
+.hero-ic { font-size: 1.8rem; width: 3rem; height: 3rem; flex: none; display: grid; place-items: center; border-radius: 14px; background: rgba(255,255,255,.16); }
+.hero-t { font-weight: 800; font-size: 1.45rem; letter-spacing: -.01em; line-height: 1.15; }
+.hero-s { opacity: .88; font-size: .92rem; margin-top: .2rem; }
+.pill { position: relative; z-index: 1; display: inline-flex; align-items: center; gap: .45rem; padding: .35rem .8rem; border-radius: 999px;
+  font-size: .8rem; font-weight: 600; background: rgba(255,255,255,.16); white-space: nowrap; }
+.pill i { width: .55rem; height: .55rem; border-radius: 50%; background: #4ADE80; box-shadow: 0 0 0 3px rgba(74,222,128,.3); }
+.pill.mid i { background: #FBBF24; box-shadow: 0 0 0 3px rgba(251,191,36,.3); }
+.pill.off i { background: #F87171; box-shadow: 0 0 0 3px rgba(248,113,113,.3); }
+
+/* ---------- section titles, stats ---------- */
+.sec { display: flex; align-items: center; gap: .55rem; font-weight: 700; font-size: 1.08rem; color: var(--ink); margin: .1rem 0 .6rem; }
+.sec .n { background: var(--brand); color: #fff; border-radius: 9px; width: 1.65rem; height: 1.65rem; display: grid; place-items: center; font-size: .85rem; }
+.cardno { font-size: .98rem; color: var(--ink); margin-bottom: .1rem; }
+.slot { font-size: .78rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--brand); margin: .2rem 0 .35rem; }
+.slot small { color: var(--muted); font-weight: 500; letter-spacing: 0; text-transform: none; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); gap: .6rem; margin: .1rem 0 .8rem; }
+.stat { background: #fff; border: 1px solid var(--line); border-radius: 14px; padding: .65rem .8rem; box-shadow: 0 1px 2px rgba(15,23,42,.04); }
+.stat b { display: block; font-size: 1.5rem; line-height: 1.1; font-weight: 800; color: var(--ink); }
+.stat span { font-size: .7rem; color: var(--muted); font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+.stat.ok b { color: var(--ok); } .stat.busy b { color: var(--busy); } .stat.bad b { color: var(--bad); } .stat.warn b { color: var(--warn); }
+.stat.live { animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(47,128,209,.35); } 50% { box-shadow: 0 0 0 7px rgba(47,128,209,0); } }
+.note { border-radius: 12px; padding: .65rem .9rem; font-size: .87rem; border: 1px solid; margin: .2rem 0 .7rem; line-height: 1.45; }
+.note.bad { background: #FEF3F2; border-color: #FECDCA; color: #B42318; }
+.note.info { background: #EFF8FF; border-color: #B2DDFF; color: #175CD3; }
+.empty { text-align: center; padding: 2.2rem 1.2rem; border: 2px dashed #CBD5E1; border-radius: 18px; background: #fff; color: var(--muted); }
+.empty .big { font-size: 2.6rem; }
+.empty h4 { margin: .3rem 0 .2rem; color: var(--ink); font-size: 1.1rem; }
+.empty ol { text-align: left; display: inline-block; margin: .6rem 0 0; padding-left: 1.2rem; line-height: 1.8; }
+
+/* ---------- tabs, buttons, uploader, table ---------- */
+.stTabs [data-baseweb="tab-list"] { gap: .35rem; background: #E7EEF7; padding: .3rem; border-radius: 14px; }
+.stTabs [data-baseweb="tab"] { flex: 1; justify-content: center; height: 2.7rem; border-radius: 10px; background: transparent; font-weight: 600; padding: 0 .5rem; }
+.stTabs [aria-selected="true"] { background: #fff; color: var(--brand); box-shadow: 0 1px 4px rgba(15,23,42,.12); }
+.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] { display: none; }
+
 [data-testid="stElementContainer"]:has(> [data-testid="stButton"]),
 [data-testid="stElementContainer"]:has(> [data-testid="stDownloadButton"]),
 [data-testid="stButton"], [data-testid="stDownloadButton"] { width: 100% !important; }
 [data-testid="stButton"] button, [data-testid="stDownloadButton"] button {
-    width: 100%; min-height: 3rem; font-size: 1.05rem; border-radius: 10px;
-}
-button { touch-action: manipulation; }   /* no double-tap-zoom delay -> fast repeated taps */
-footer {visibility: hidden;}
+    width: 100%; min-height: 3rem; font-size: 1.02rem; font-weight: 600; border-radius: 12px; transition: transform .08s ease, filter .15s ease; }
+[data-testid="stButton"] button:active, [data-testid="stDownloadButton"] button:active { transform: scale(.985); }
+button[kind="primary"], [data-testid="stBaseButton-primary"] {
+    background: linear-gradient(135deg, #1F4E78, #2F80D1) !important; border: 0 !important; color: #fff !important;
+    box-shadow: 0 6px 16px rgba(31,78,120,.28); }
+button[kind="primary"]:hover, [data-testid="stBaseButton-primary"]:hover { filter: brightness(1.07); }
+button[kind="primary"]:disabled, [data-testid="stBaseButton-primary"]:disabled { background: #CBD5E1 !important; box-shadow: none; }
 
-/* Front / back slots stay SIDE BY SIDE, also on a phone */
-div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: 0.6rem !important; }
-div[data-testid="stHorizontalBlock"] > div { min-width: 0 !important; flex: 1 1 0 !important; }
-[data-testid="stImage"] img { max-height: 38vh; object-fit: contain; border-radius: 8px; border: 1px solid #d0d7de; }
+[data-testid="stFileUploaderDropzone"] { border: 2px dashed #B8C7DA; border-radius: 14px; background: #fff; transition: border-color .15s, background .15s; }
+[data-testid="stFileUploaderDropzone"]:hover { border-color: var(--brand2); background: #F8FBFF; }
+[data-testid="stImage"] img { max-height: 38vh; object-fit: contain; border-radius: 10px; border: 1px solid var(--line); }
+[data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+[data-testid="stSidebar"] { background: #fff; border-right: 1px solid var(--line); }
+
+/* front / back slots stay SIDE BY SIDE, also on a phone */
+[class*="st-key-slots_"] [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: .6rem !important; }
+[class*="st-key-slots_"] [data-testid="stHorizontalBlock"] > div { min-width: 0 !important; flex: 1 1 0 !important; }
+
+/* export bar sticks to the bottom while the table is on screen */
+.st-key-exportbar { position: sticky; bottom: .6rem; z-index: 40; padding: .55rem .7rem; border-radius: 16px;
+    background: rgba(255,255,255,.93); backdrop-filter: blur(8px); border: 1px solid var(--line); box-shadow: 0 10px 28px rgba(15,23,42,.14); }
 
 /* ---------- Browser camera: FULL SCREEN with a big capture bar ---------- */
 .st-key-camfs {
@@ -162,20 +234,19 @@ div.st-key-cam_close[data-testid="stElementContainer"]:has(> [data-testid="stBut
     width: auto !important; left: auto !important; right: 0.6rem !important; top: 0.5rem !important;
 }
 .st-key-cam_close [data-testid="stButton"] { width: auto !important; }
-.st-key-cam_close button { min-height: 2.6rem; width: auto !important; padding: 0 1rem; background: #000a; color: #fff; border: 1px solid #fff8; }
+.st-key-cam_close button { min-height: 2.6rem; width: auto !important; padding: 0 1rem; background: #000a !important; color: #fff !important; border: 1px solid #fff8 !important; box-shadow: none; }
 
 @media (max-width: 640px) {
-    .block-container {padding: 1rem 0.8rem 5rem 0.8rem;}
-    h1 {font-size: 1.7rem !important;}
-    [data-testid="stButton"] button, [data-testid="stDownloadButton"] button {min-height: 3.4rem; font-size: 1.1rem;}
+    .block-container { padding: .7rem .7rem 5rem .7rem; }
+    .hero { flex-direction: column; align-items: flex-start; padding: .95rem 1rem; }
+    .hero-t { font-size: 1.3rem; }
+    [data-testid="stButton"] button, [data-testid="stDownloadButton"] button { min-height: 3.4rem; font-size: 1.1rem; }
     /* Phone scan: one huge tap area per side instead of a small "Browse files" button */
-    [data-testid="stFileUploaderDropzone"] {
-        min-height: 7rem; justify-content: center; border-radius: 12px; padding: 0.4rem;
-    }
-    [data-testid="stFileUploaderDropzoneInstructions"] {display: none;}
+    [data-testid="stFileUploaderDropzone"] { min-height: 7rem; justify-content: center; border-radius: 12px; padding: 0.4rem; }
+    [data-testid="stFileUploaderDropzoneInstructions"] { display: none; }
     [data-testid="stFileUploaderDropzone"] button {
         width: 100%; min-height: 5.5rem; font-size: 1.1rem; font-weight: 700;
-        background: #1F4E78; color: #fff; border-radius: 12px;
+        background: linear-gradient(135deg, #1F4E78, #2F80D1); color: #fff; border-radius: 12px; border: 0;
     }
 }
 </style>
@@ -254,6 +325,7 @@ class CardStore:
         self.next_id = 1
         self.version = 0     # bumps on every change (used to cache the Excel bytes)
         self._xlsx = (-1, b"")
+        self._df = (-1, None)   # (version, DataFrame): the table is rebuilt only when something changed
 
     # ---- adding / reading ----
     def submit(self, front, back, raw=False) -> int:
@@ -287,7 +359,9 @@ class CardStore:
             card = self.cards.get(cid)
             if card is None:      # removed while reading
                 return
-            card.update(status=status, row=row, error=err, front=front, back=back, raw=False)
+            keep = status == "failed"   # photos are only needed again for "Retry"; free the RAM for finished cards
+            card.update(status=status, row=row, error=err, front=front if keep else None,
+                        back=back if keep else None, raw=False)
             self.version += 1
 
     def retry_failed(self) -> int:
@@ -319,9 +393,15 @@ class CardStore:
     def dataframe(self) -> pd.DataFrame:
         """Finished rows in upload order; index = card id (used to map edits back)."""
         with self.lock:
+            version = self.version
+            if self._df[0] == version:
+                return self._df[1]
             ids = sorted(i for i, c in self.cards.items() if c["row"] is not None)
             rows = [dict(self.cards[i]["row"]) for i in ids]
-        return pd.DataFrame(rows, index=pd.Index(ids, name="id"), columns=HEADERS)
+        df = pd.DataFrame(rows, index=pd.Index(ids, name="id"), columns=HEADERS)
+        with self.lock:
+            self._df = (version, df)   # callers must not modify it in place (they copy)
+        return df
 
     # ---- edits from the table ----
     def apply_edits(self, edited: pd.DataFrame):
@@ -338,6 +418,12 @@ class CardStore:
                     card["row"] = new_row
                     if card["status"] == "failed":   # fixed by hand
                         card.update(status="done", error="")
+            self.version += 1
+
+    def remove(self, ids):
+        with self.lock:
+            for i in ids:
+                self.cards.pop(int(i), None)
             self.version += 1
 
     def clear_all(self):
@@ -511,10 +597,95 @@ def to_excel(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+def review_flags(df: pd.DataFrame) -> dict:
+    """card id -> '' (looks fine) or a short warning: duplicate / manual entry needed / name or contact missing."""
+    flags, seen = {}, {}
+    for cid, r in df.iterrows():
+        keys = set()
+        for field in ("Mobile", "Phone / Landline"):
+            for p in _parts(r[field]):
+                if _phone_kind(p, "mobile" if field == "Mobile" else "tele") == "mobile":
+                    d = re.sub(r"\D", "", p)[-10:]
+                    if len(d) >= 10:
+                        keys.add("m" + d)          # a landline is shared by colleagues, so only mobiles count
+        keys.update("e" + e.lower() for e in _parts(r["Email"]))
+        nm, co = re.sub(r"\W", "", r["Name"]).lower(), re.sub(r"\W", "", r["Company"]).lower()
+        if nm and co:
+            keys.add(f"n{nm}|{co}")
+        first = next((seen[k] for k in keys if k in seen), None)
+        if first is not None:
+            flags[cid] = f"⚠ Duplicate (card #{first})"
+            continue
+        for k in keys:
+            seen[k] = cid
+        if "EXTRACTION FAILED" in r["Other Notes"]:
+            flags[cid] = "⚠ Haath se bharo"
+        else:
+            miss = [w for w, ok in (("naam", clean(r["Name"])),
+                                    ("contact", clean(r["Mobile"]) or clean(r["Phone / Landline"]) or clean(r["Email"]))) if not ok]
+            flags[cid] = ("⚠ " + " + ".join(miss) + " nahi") if miss else ""
+    return flags
+
+
+# ------------------------- cards survive a page refresh -------------------------
+# Phones kill browser tabs all the time. Each visit gets a short token in the URL (?s=...); the cards live
+# on the server under that token, so a refresh / reopening the same link brings them back (and a laptop can open
+# the same link to see what the phone is scanning).
+@st.cache_resource
+def _registry() -> dict:
+    """Lives for the whole server process (Streamlit re-runs this file on every click, so a plain module-level dict
+    would be emptied each time)."""
+    return {"stores": {}, "lock": threading.Lock()}   # token -> [CardStore, last_seen]
+
+
+def _register(token: str, store: "CardStore"):
+    reg = _registry()
+    with reg["lock"]:
+        reg["stores"][token] = [store, time.time()]
+
+
+def _touch(token: str, store: "CardStore"):
+    reg = _registry()
+    with reg["lock"]:
+        entry = reg["stores"].get(token)
+        if entry:
+            entry[1] = time.time()
+            return
+    _register(token, store)   # was cleaned up while the page stayed open
+
+
+def _gc_stores():
+    reg, now = _registry(), time.time()
+    with reg["lock"]:
+        stale = [t for t, (_, seen) in reg["stores"].items() if now - seen > STORE_TTL]
+        victims = [reg["stores"].pop(t)[0] for t in stale]
+    for v in victims:
+        v.pool.shutdown(wait=False, cancel_futures=True)
+
+
+def get_store():
+    _gc_stores()
+    reg = _registry()
+    token = st.query_params.get("s", "")
+    with reg["lock"]:
+        entry = reg["stores"].get(token) if token else None
+        if entry:
+            entry[1] = time.time()
+    if entry:
+        return token, entry[0]
+    token, store = secrets.token_urlsafe(9), CardStore()
+    _register(token, store)
+    st.query_params["s"] = token
+    return token, store
+
+
 # ------------------------- session state -------------------------
 def init_state():
     ss = st.session_state
-    ss.setdefault("store", CardStore())
+    if "store" not in ss:
+        ss.token, ss.store = get_store()
+    else:   # keep the server-side copy alive while this session is open
+        _touch(ss.token, ss.store)
     ss.setdefault("phone_n", 0)      # bumping it resets the phone-scan uploaders after "Save"
     ss.setdefault("cam_front", None)  # raw bytes of the browser-camera shots for the card in progress
     ss.setdefault("cam_back", None)
@@ -525,23 +696,45 @@ def init_state():
     ss.setdefault("was_pending", False)
 
 
-def submit_card(front, back, raw=False) -> bool:
+def submit_card(front, back, raw=False) -> int:
     """Send one card (front + optional back) to be read in the background right away."""
     ss = st.session_state
     if ss.store.pending() >= MAX_PENDING:
         st.error(f"Ek saath max {MAX_PENDING} cards read ho sakte hain. Thoda ruko, pehle wale ho jayen.")
-        return False
-    ss.store.submit(front, back, raw=raw)
-    return True
+        return 0
+    return ss.store.submit(front, back, raw=raw)
 
 
 # ------------------------- UI pieces -------------------------
+def _reader_pill():
+    if gemini_engine.enabled():
+        return "", "Gemini ON"
+    if ocr_fallback_enabled():
+        return "mid", "Offline OCR"
+    return "off", "API key missing"
+
+
+def hero():
+    cls, txt = _reader_pill()
+    st.markdown(
+        '<div class="hero"><div class="hero-left"><div class="hero-ic">📇</div><div>'
+        '<div class="hero-t">Visiting Card Scanner</div>'
+        '<div class="hero-s">Photo lo → AI padhe → company ke format ka Excel taiyaar</div></div></div>'
+        f'<div class="pill {cls}"><i></i>{txt}</div></div>',
+        unsafe_allow_html=True)
+
+
+def section(num: int, title: str):
+    st.markdown(f'<div class="sec"><span class="n">{num}</span>{html.escape(title)}</div>', unsafe_allow_html=True)
+
+
 def password_gate():
     pw = get_secret("APP_PASSWORD")
     if not pw or st.session_state.get("authed"):
         return
-    st.title("📇 Visiting Card Scanner")
-    with st.form("login"):
+    hero()
+    _, mid, _ = st.columns([1, 2, 1])
+    with mid, st.form("login"):
         entered = st.text_input("Password", type="password")
         ok = st.form_submit_button("Login", type="primary")
     if ok:
@@ -582,34 +775,39 @@ def scan_flow(mode: str):
     ss = st.session_state
     if mode == "cam" and ss.cam_open:
         camera_overlay()
-    st.markdown(f"**Card #{ss.store.next_id}** · front aur back ek saath lo, phir ek baar Save")
+    st.markdown(f"<div class='cardno'>Card <b>#{ss.store.next_id}</b> · front aur back ek saath lo, phir ek baar Save</div>",
+                unsafe_allow_html=True)
     if mode == "phone":
         st.caption("Dono side ke box me **Upload** dabao → **Camera / Take Photo** chuno. Back optional hai, order koi bhi chalega.")
     else:
         st.caption("Camera full screen khulega. Front lete hi back ka camera khud khul jayega.")
 
     shots = {}
-    for col, side in zip(st.columns(2, gap="small"), ("front", "back")):
-        with col:
-            st.markdown(f"**{SIDE_LABEL[side]}**" + (" · optional" if side == "back" else ""))
-            if mode == "phone":
-                f = st.file_uploader(f"{side} photo", type=EXTS, key=f"phone_{ss.phone_n}_{side}",
-                                     label_visibility="collapsed")
-                shots[side] = f.getvalue() if f else None
-            else:
-                shots[side] = ss[f"cam_{side}"]
-                if st.button(("🔄 Retake" if shots[side] else "📷 Take") + f" {side}", key=f"cam_btn_{side}"):
-                    ss.cam_open = side
-                    ss.cam_k += 1
-                    st.rerun()
-            if shots[side]:
-                st.image(preview(shots[side]))
+    with st.container(key=f"slots_{mode}"):
+        for col, side in zip(st.columns(2, gap="small"), ("front", "back")):
+            with col:
+                st.markdown(f"<div class='slot'>{SIDE_LABEL[side]}" + (" <small>· optional</small>" if side == "back" else "") + "</div>",
+                            unsafe_allow_html=True)
+                if mode == "phone":
+                    f = st.file_uploader(f"{side} photo", type=EXTS, key=f"phone_{ss.phone_n}_{side}",
+                                         label_visibility="collapsed")
+                    shots[side] = f.getvalue() if f else None
+                else:
+                    shots[side] = ss[f"cam_{side}"]
+                    if st.button((("🔄 Retake" if shots[side] else "📷 Take") + f" {side}"), key=f"cam_btn_{side}"):
+                        ss.cam_open = side
+                        ss.cam_k += 1
+                        st.rerun()
+                if shots[side]:
+                    st.image(preview(shots[side]))
 
     if st.button("✅ Save card", type="primary", disabled=not shots["front"], key=f"{mode}_save"):
         base = f"card_{ss.store.next_id:03d}"
         front = (f"{base}_front.jpg", shots["front"])
         back = (f"{base}_back.jpg", shots["back"]) if shots["back"] else None
-        if submit_card(front, back, raw=True):   # shrinking happens in the background worker
+        cid = submit_card(front, back, raw=True)   # shrinking happens in the background worker
+        if cid:
+            ss.flash = f"Card #{cid} save ho gaya, reading shuru ✅"
             if mode == "phone":
                 ss.phone_n += 1
             else:
@@ -634,17 +832,66 @@ def upload_tab():
     pairs = list(zip_longest(fronts, backs))
 
     if st.button(f"➕ Add {len(pairs)} card(s) - reading turant shuru", disabled=not pairs, type="primary"):
+        added = 0
         for f, b in pairs:
             front = (f.name, f.getvalue()) if f else None
             back = (b.name, b.getvalue()) if b else None
             if not submit_card(front, back, raw=True):
                 break
+            added += 1
+        ss.flash = f"{added} card(s) add hue, reading shuru ✅"
         ss.up_n += 1
         st.rerun()
 
 
 def _norm(df: pd.DataFrame) -> pd.DataFrame:
     return df.fillna("").astype(str)
+
+
+def _col(kind, label=None, **kw):
+    """st.column_config.<kind>; drops options an older Streamlit does not know (e.g. pinned)."""
+    factory = getattr(st.column_config, kind)
+    try:
+        return factory(label, **kw)
+    except TypeError:
+        kw.pop("pinned", None)
+        return factory(label, **kw)
+
+
+def _table_config() -> dict:
+    cfg = {
+        "#": _col("NumberColumn", "#", width="small", disabled=True, pinned=True, format="%d"),
+        "Name": _col("TextColumn", "Name", width="medium", pinned=True),
+        "Delete": _col("CheckboxColumn", "🗑", width="small", help="Tick karo → ye card hat jayega"),
+        "Check": _col("TextColumn", "Check", width="medium", disabled=True,
+                      help="Duplicate / naam ya contact missing wale cards yahan flag hote hain"),
+        "Address": _col("TextColumn", "Address", width="large"),
+        "Services / Products": _col("TextColumn", "Services / Products", width="large"),
+        "Other Notes": _col("TextColumn", "Other Notes", width="medium"),
+        "Front File": _col("TextColumn", "Front File", disabled=True),
+        "Back File": _col("TextColumn", "Back File", disabled=True),
+    }
+    return cfg
+
+
+def stats_html(total, counts, n_review) -> str:
+    live = " live" if counts["reading"] else ""
+    tiles = [
+        ("", total, "Total"),
+        ("ok", counts["done"], "Ready"),
+        (f"busy{live}", counts["reading"], "Reading"),
+        ("bad", counts["failed"], "Failed"),
+        ("warn", n_review, "Check karo"),
+    ]
+    return '<div class="stats">' + "".join(f'<div class="stat {c}"><b>{n}</b><span>{lbl}</span></div>' for c, n, lbl in tiles) + "</div>"
+
+
+EMPTY_HTML = (
+    '<div class="empty"><div class="big">🗂️</div><h4>Abhi koi card nahi</h4>'
+    '<div>Card scan hote hi yahan table banti jayegi.</div>'
+    '<ol><li>Front (aur back) ki photo lo</li><li><b>Save card</b> dabao, AI turant padhna shuru kar dega</li>'
+    '<li>Table check karo → <b>Export Excel</b></li></ol></div>'
+)
 
 
 def results_panel():
@@ -660,106 +907,145 @@ def results_panel():
         st.rerun()
     ss.was_pending = counts["reading"] > 0
 
-    st.divider()
     if total == 0:
-        st.subheader("Cards")
-        st.caption("Abhi koi card nahi. Upar se photo lo ya upload karo, card turant read hona shuru ho jayega.")
+        st.markdown(EMPTY_HTML, unsafe_allow_html=True)
         return
 
-    st.subheader(f"Cards: {total}")
-    st.markdown(f"✅ **{counts['done']}** ready · ⏳ **{counts['reading']}** reading · ⚠️ **{counts['failed']}** failed")
-    if counts["reading"]:
-        st.progress((counts["done"] + counts["failed"]) / total, text="Cards background me read ho rahe hain, aap agla card add karte rahiye…")
-
-    for err in store.errors()[:5]:
-        st.error(err)
-
     df = store.dataframe()
+    flags = review_flags(df) if not df.empty else {}
+    n_review = sum(1 for f in flags.values() if f)
+    st.markdown(stats_html(total, counts, n_review), unsafe_allow_html=True)
+    if counts["reading"]:
+        st.progress((counts["done"] + counts["failed"]) / total,
+                    text="Cards background me read ho rahe hain, aap agla card add karte rahiye…")
+
+    errs = store.errors()
+    if errs:   # the same reason usually repeats for every card -> show each reason once
+        uniq = list(dict.fromkeys(e.split(": ", 1)[-1] for e in errs))[:3]
+        st.markdown(f'<div class="note bad"><b>{len(errs)} card read nahi hue.</b><br>'
+                    + "<br>".join(html.escape(u) for u in uniq) + "</div>", unsafe_allow_html=True)
+
     if not df.empty:
-        st.caption("Galti ho to table me seedha edit karo. Kisi row ko hatana ho to Delete tick karo. Phone par table side me scroll hoti hai.")
+        st.caption("Galti ho to table me seedha edit karo. Hatana ho to 🗑 tick karo. Phone par table side me scroll hoti hai.")
         view = df.copy()
-        view.insert(0, "Delete", False)
+        view.insert(0, "#", view.index.astype(int))
+        view.insert(2, "Delete", False)
+        view.insert(3, "Check", [flags.get(i, "") for i in df.index])
         key = f"editor_{ss.editor_ver}_{hash(tuple(df.index))}"
-        edited = st.data_editor(view, key=key, hide_index=True, num_rows="fixed")
+        edited = st.data_editor(view, key=key, hide_index=True, num_rows="fixed", column_config=_table_config(),
+                                disabled=["#", "Check", "Front File", "Back File"],
+                                height=min(40 + 36 * len(view), 540))
         if not _norm(edited).equals(_norm(view)):
             store.apply_edits(edited)
             ss.editor_ver += 1
             st.rerun()
 
+    dups = [i for i, f in flags.items() if f.startswith("⚠ Duplicate")]
+    actions = []
+    if counts["failed"]:
+        actions.append(("🔁 Failed cards dobara", "retry"))
+    if dups:
+        actions.append((f"🧹 {len(dups)} duplicate hatao", "dups"))
+    if actions:
+        for col, (label, what) in zip(st.columns(len(actions)), actions):
+            with col:
+                if st.button(label, key=f"act_{what}"):
+                    if what == "retry":
+                        store.retry_failed()
+                    else:
+                        store.remove(dups)
+                        ss.editor_ver += 1
+                    st.rerun()
+
     n_ready = counts["done"] + counts["failed"]
-    st.download_button(
-        f"⬇️ Export Excel ({n_ready} cards)",
-        data=store.excel_bytes(),
-        file_name="visiting_cards.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-        disabled=n_ready == 0,
-    )
+    with st.container(key="exportbar"):
+        st.download_button(
+            f"⬇️ Export Excel ({n_ready} cards)",
+            data=store.excel_bytes if DL_LAZY else store.excel_bytes(),   # lazy: built only on click
+            file_name=time.strftime("Cards_%Y-%m-%d_%H-%M.xlsx"),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            disabled=n_ready == 0,
+            **({"on_click": "ignore"} if DL_LAZY else {}),   # downloading does not re-run the page
+        )
     if counts["reading"]:
         st.caption(f"⏳ {counts['reading']} card(s) abhi read ho rahe hain. Export abhi tak ke ready cards ka hoga; baaki ready hote hi table aur Excel me aa jayenge.")
 
-    if counts["failed"] and st.button("🔁 Retry failed cards"):
-        store.retry_failed()
-        st.rerun()
-    with st.expander("Sab cards clear karo"):
-        if st.button("🗑️ Clear all cards"):
+    with st.expander("Aur options"):
+        if st.button("🗑️ Sab cards clear karo"):
+            old = ss.store
             ss.store = CardStore()
+            _register(ss.token, ss.store)
+            old.pool.shutdown(wait=False, cancel_futures=True)
             ss.editor_ver += 1
             st.rerun()
 
 
-def main():
-    if get_secret("GEMINI_API_KEY"):   # make secrets visible to gemini_engine
-        os.environ["GEMINI_API_KEY"] = get_secret("GEMINI_API_KEY")
-    for _k in ("GEMINI_MODELS", "GEMINI_RPM"):
-        if get_secret(_k):
-            os.environ[_k] = get_secret(_k)
-    warmup()   # load OCR model in background while the page renders
-    st.set_page_config(page_title="Visiting Card Scanner", page_icon="📇", layout="wide")
-    st.markdown(STYLE, unsafe_allow_html=True)
-    password_gate()
-    init_state()
-    ss = st.session_state
-    if hasattr(st, "iframe"):   # newer Streamlit; components.html is being removed
-        st.iframe(REAR_CAMERA_JS.strip(), height=1)
-    else:
-        components.html(REAR_CAMERA_JS, height=0)
-
-    st.title("📇 Visiting Card Scanner")
-    st.caption("Card ki photo lo ya upload karo (front + back) → turant read hoke Excel me judta jayega → jab chahein Export.")
-
+def sidebar():
     with st.sidebar:
+        st.markdown("### 📇 Card Scanner")
         st.markdown(
             "**Kaise use karein**\n\n"
-            "1. Phone scan se card (front + back) save karo\n"
-            "2. Card turant background me read hota hai, aap agla le sakte ho\n"
-            "3. Table check/edit karo\n"
-            "4. *Export Excel*\n\n"
-            "Saare cards ek hi Excel me jud jate hain."
+            "1. Card ki photo lo (front + back)\n"
+            "2. **Save card** dabao, AI turant padhna shuru kar deta hai, aap agla card le sakte ho\n"
+            "3. Table check/edit karo (⚠ wale cards dekh lo)\n"
+            "4. **Export Excel**\n\n"
+            "Saare cards ek hi Excel me, company ke format me."
         )
+        st.divider()
         if gemini_engine.enabled():
             fb = gemini_engine.status["fallbacks"]
-            st.caption("🤖 Gemini ON (front + back dono side ek saath read hoti hain)" + (f" · {fb} card(s) offline OCR se read hue (Gemini limit)" if fb else ""))
+            st.caption("🤖 Gemini ON · front + back dono side ek saath read hoti hain"
+                       + (f" · {fb} card(s) offline OCR se read hue (Gemini limit)" if fb else ""))
             if gemini_engine.status["last"]:
                 st.caption(gemini_engine.status["last"])
         elif ocr_fallback_enabled():
             st.caption("💻 Offline OCR mode (Gemini key nahi hai)")
         else:
             st.error("GEMINI_API_KEY set nahi hai. Render → Environment me key daaliye, tabhi cards read honge.")
+        st.caption("💾 Page refresh ya phone lock hone par bhi cards bache rehte hain. Isi link ko laptop par kholo to wahi cards dikhenge.")
         if get_secret("APP_PASSWORD") and st.button("Logout"):
+            st.query_params.clear()
             st.session_state.clear()
             st.rerun()
 
-    tab_phone, tab_cam, tab_up = st.tabs(["📱 Phone scan", "📷 Browser camera", "📁 Bulk upload"])
-    with tab_phone:
-        scan_flow("phone")
-    with tab_cam:
-        scan_flow("cam")
-    with tab_up:
-        upload_tab()
 
-    # auto-refresh every few seconds only while something is still being read
-    st.fragment(run_every=REFRESH_SECS if ss.store.pending() else None)(results_panel)()
+def main():
+    st.set_page_config(page_title="Visiting Card Scanner", page_icon="📇", layout="wide")
+    if get_secret("GEMINI_API_KEY"):   # make secrets visible to gemini_engine
+        os.environ["GEMINI_API_KEY"] = get_secret("GEMINI_API_KEY")
+    for _k in ("GEMINI_MODELS", "GEMINI_RPM", "OCR_FALLBACK"):
+        if get_secret(_k):
+            os.environ[_k] = get_secret(_k)
+    warmup()   # loads the offline OCR model only when it can really be used
+    st.markdown(STYLE, unsafe_allow_html=True)
+    password_gate()
+    init_state()
+    ss = st.session_state
+    if ss.get("flash"):
+        st.toast(ss.pop("flash"))
+    if hasattr(st, "iframe"):   # newer Streamlit; components.html is being removed
+        st.iframe(REAR_CAMERA_JS.strip(), height=1)
+    else:
+        components.html(REAR_CAMERA_JS, height=0)
+
+    hero()
+    sidebar()
+
+    left, right = st.columns([5, 6], gap="large")   # desktop: scan on the left, live table on the right; phone: stacked
+    with left:
+        section(1, "Card scan karo")
+        tab_phone, tab_cam, tab_up = st.tabs(["📱 Phone scan", "📷 Browser camera", "📁 Bulk upload"])
+        with tab_phone:
+            scan_flow("phone")
+        with tab_cam:
+            scan_flow("cam")
+        with tab_up:
+            upload_tab()
+    with right:
+        section(2, "Check karo aur Excel export karo")
+        # auto-refresh every few seconds only while something is still being read
+        st.fragment(run_every=REFRESH_SECS if ss.store.pending() else None)(results_panel)()
 
 
 if __name__ == "__main__":

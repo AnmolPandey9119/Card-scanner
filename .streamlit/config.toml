@@ -1,9 +1,18 @@
 [server]
 maxUploadSize = 50
 enableXsrfProtection = true
+fileWatcherType = "none"      # production: no file-watching overhead
+
+[client]
+toolbarMode = "minimal"       # hides the developer "Deploy" toolbar
 
 [browser]
 gatherUsageStats = false
 
 [theme]
-primaryColor = "#1F4E78"
+base = "light"
+primaryColor = "#1F6FB2"
+backgroundColor = "#F5F8FC"
+secondaryBackgroundColor = "#EAF1F9"
+textColor = "#0F172A"
+font = "sans serif"
