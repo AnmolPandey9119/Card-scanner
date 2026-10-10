@@ -21,12 +21,12 @@ import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 
 import gemini_engine
-from card_reader import read_card, warmup
+from card_reader import cpu_budget, read_card, warmup
 
 MAX_SIDE = 1280   # photos are shrunk to this before being stored / sent
 MAX_PENDING = 60  # max cards being read at the same time
-WORKERS = 2       # cards read in parallel (OCR is CPU heavy; keep low on small servers)
-REFRESH_SECS = 1  # live status refresh while cards are being read
+WORKERS = 1 if cpu_budget() < 1.5 else 2   # cards read in parallel (OCR is CPU heavy; follows the server's real CPU)
+REFRESH_SECS = 2  # live status refresh while cards are being read (each refresh redraws the table)
 EXTS = ["jpg", "jpeg", "png", "webp"]
 
 HEADERS = [
@@ -161,10 +161,12 @@ def get_secret(name: str) -> str:
 def compress_image(file_bytes: bytes) -> bytes:
     """Fix rotation, shrink and re-encode as JPEG (keeps memory low)."""
     img = Image.open(io.BytesIO(file_bytes))
+    if img.format == "JPEG":
+        img.draft("RGB", (MAX_SIDE, MAX_SIDE))   # decode a 12MP photo at ~1/2-1/4 size straight away
     img = ImageOps.exif_transpose(img).convert("RGB")
     img.thumbnail((MAX_SIDE, MAX_SIDE))
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=90)
+    img.save(buf, format="JPEG", quality=88)
     return buf.getvalue()
 
 
@@ -398,13 +400,15 @@ def to_excel(df: pd.DataFrame) -> bytes:
             cell.font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
             cell.fill = PatternFill("solid", fgColor="0070C0")
             cell.alignment = Alignment(vertical="center")
-        for row in ws.iter_rows(min_row=2):
-            for c in row:  # text from a card must never run as an Excel formula
-                if isinstance(c.value, str) and c.value.startswith("="):
-                    c.data_type = "s"
-        for col in ws.columns:
-            longest = max(len(str(c.value or "")) for c in col)
-            ws.column_dimensions[col[0].column_letter].width = min(max(longest + 2, 12), 50)
+        text = df.astype(str)
+        if text.apply(lambda col: col.str.startswith("=")).to_numpy().any():
+            for row in ws.iter_rows(min_row=2):
+                for c in row:  # text from a card must never run as an Excel formula
+                    if isinstance(c.value, str) and c.value.startswith("="):
+                        c.data_type = "s"
+        for i, name in enumerate(df.columns, start=1):
+            longest = max(len(str(name)), int(text[name].str.len().max() or 0) if len(text) else 0)
+            ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = min(max(longest + 2, 12), 50)
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = ws.dimensions
     return buf.getvalue()

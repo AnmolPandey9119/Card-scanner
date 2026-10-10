@@ -4,6 +4,10 @@ import gemini_engine
 import ocr_engine
 
 
+def cpu_budget() -> float:
+    return ocr_engine.cpu_budget()
+
+
 def warmup():
     ocr_engine.warmup()   # offline model is the fallback, keep it ready
 

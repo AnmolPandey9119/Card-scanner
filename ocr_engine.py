@@ -1,21 +1,64 @@
 """Free, offline card reader: RapidOCR (ONNX) for text + rule-based parser for fields.
 No API key, no internet needed after install (models ship inside the pip package)."""
 import io
+import os
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from PIL import Image
 
 _engine = None
 _engine_lock = threading.Lock()
+_warming = False
 DET_MAX_SIDE = 960   # smaller = faster detection; cards have big enough text for this
+
+
+def cpu_budget() -> float:
+    """CPU cores this container may really use (cgroup quota), not what the big host machine has."""
+    try:
+        q, per = open("/sys/fs/cgroup/cpu.max").read().split()[:2]
+        if q != "max":
+            return max(0.1, int(q) / int(per))
+    except Exception:
+        pass
+    try:
+        q = int(open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read())
+        per = int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read())
+        if q > 0:
+            return max(0.1, q / per)
+    except Exception:
+        pass
+    try:
+        return float(len(os.sched_getaffinity(0)))
+    except Exception:
+        return float(os.cpu_count() or 1)
+
+
+def _limit_ort_threads():
+    """onnxruntime starts one thread per HOST core by default; on a small cloud container that
+    oversubscribes the few cores we actually get and makes OCR several times slower."""
+    try:
+        import rapidocr_onnxruntime.utils as u
+        n = max(1, min(4, int(round(cpu_budget()))))
+
+        class _Opts(u.SessionOptions):
+            def __init__(self):
+                super().__init__()
+                self.intra_op_num_threads = n
+                self.inter_op_num_threads = 1
+
+        u.SessionOptions = _Opts
+    except Exception:
+        pass   # never block OCR because of a tuning step
 
 
 def _get_engine():
     global _engine
     with _engine_lock:
         if _engine is None:
+            _limit_ort_threads()
             from rapidocr_onnxruntime import RapidOCR
             _engine = RapidOCR(det_model_path=None, det_limit_type="max", det_limit_side_len=DET_MAX_SIDE)
             _engine(np.zeros((320, 320, 3), dtype=np.uint8))   # warm-up so the first real card is fast
@@ -23,7 +66,12 @@ def _get_engine():
 
 
 def warmup():
-    """Load the OCR model in the background (call once at app start)."""
+    """Load the OCR model in the background. Safe to call on every Streamlit rerun (starts only once)."""
+    global _warming
+    with _engine_lock:
+        if _engine is not None or _warming:
+            return
+        _warming = True
     threading.Thread(target=_get_engine, daemon=True).start()
 
 
@@ -80,19 +128,40 @@ def _flatness(items):
     return r[len(r) // 2]
 
 
+def _flat(arr) -> float:
+    """Median width/height of detected text boxes (detection only, ~5x cheaper than a full read)."""
+    boxes, _ = _get_engine().text_detector(arr)
+    if boxes is None or len(boxes) == 0:
+        return 0.0
+    r = sorted((float(np.ptp(b[:, 0])) + 1) / (float(np.ptp(b[:, 1])) + 1) for b in boxes)
+    return r[len(r) // 2]
+
+
+def _best_rotation(arr, items):
+    cands = [items] if items else []
+    cands += [_run(np.ascontiguousarray(np.rot90(arr, k))) for k in (1, 3)]
+    top = max(_score(c) for c in cands)
+    good = [c for c in cands if _score(c) >= 0.8 * top]
+    return max(good, key=_flatness)   # upright text has wide, flat boxes
+
+
 def ocr_lines(jpeg_bytes: bytes) -> list:
     """Return text lines top-to-bottom: [{"text", "h", "y"}] (h = text height, used for font size)."""
     img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
     arr = np.array(img)[:, :, ::-1]   # RGB -> BGR
-    items = _run(arr)
-    items = _recheck_at(arr, items)
-    portrait = arr.shape[0] > arr.shape[1] * 1.15   # cards are usually landscape -> may be sideways
-    if portrait or _score(items) < 25:   # try 90 / 270 degrees as well
-        cands = [items] + [_run(np.ascontiguousarray(np.rot90(arr, k))) for k in (1, 3)]
-        top = max(_score(c) for c in cands)
-        good = [c for c in cands if _score(c) >= 0.8 * top]
-        # upright text has wide, flat boxes: pick the candidate with the flattest boxes
-        items = max(good, key=_flatness)
+    sideways = False
+    if arr.shape[0] > arr.shape[1] * 1.15:   # portrait shot: card may be upright (common) or turned 90 degrees
+        # cheap check first: text *detection* only (no reading). Upright text = wide, flat boxes.
+        f0 = _flat(arr)
+        if f0 < 1.5:
+            f1 = _flat(np.ascontiguousarray(np.rot90(arr, 1)))
+            sideways = f1 >= 1.5 and f1 > f0
+    if sideways:
+        items = _best_rotation(arr, [])           # read both 90 / 270, keep the better one
+    else:
+        items = _recheck_at(arr, _run(arr))       # normal case: ONE full read
+        if _score(items) < 25:                    # nothing readable -> last resort, try every rotation
+            items = _best_rotation(arr, items)
     # group boxes that sit on the same visual line (left-to-right), then order top-to-bottom
     items.sort(key=lambda d: d["yc"])
     lines, cur = [], []
@@ -595,10 +664,17 @@ def reconcile_row(row: dict) -> dict:
     return r
 
 
+_side_pool = ThreadPoolExecutor(max_workers=2)
+
+
 def read_card(front_jpeg, back_jpeg) -> dict:
     """front_jpeg / back_jpeg: bytes or None -> dict of fields."""
-    f = ocr_lines(front_jpeg) if front_jpeg else []
-    b = ocr_lines(back_jpeg) if back_jpeg else []
+    if front_jpeg and back_jpeg and cpu_budget() >= 3:   # both sides at once only if cores are free
+        ff = _side_pool.submit(ocr_lines, front_jpeg)
+        f, b = ff.result(), ocr_lines(back_jpeg)
+    else:
+        f = ocr_lines(front_jpeg) if front_jpeg else []
+        b = ocr_lines(back_jpeg) if back_jpeg else []
     if not f and not b:
         raise RuntimeError("Image me koi text nahi mila (photo blur / bahut dark ho sakti hai).")
     return parse_card(f, b)
