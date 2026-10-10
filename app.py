@@ -21,11 +21,10 @@ import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 
 import gemini_engine
-from card_reader import cpu_budget, read_card, warmup
+from card_reader import max_workers, ocr_fallback_enabled, read_card, warmup
 
-MAX_SIDE = 1280   # photos are shrunk to this before being stored / sent
+MAX_SIDE = 1200   # photos are shrunk to this before being stored / sent (card text stays sharp, upload stays small)
 MAX_PENDING = 60  # max cards being read at the same time
-WORKERS = 1 if cpu_budget() < 1.5 else 2   # cards read in parallel (OCR is CPU heavy; follows the server's real CPU)
 REFRESH_SECS = 2  # live status refresh while cards are being read (each refresh redraws the table)
 EXTS = ["jpg", "jpeg", "png", "webp"]
 
@@ -198,7 +197,20 @@ def compress_image(file_bytes: bytes) -> bytes:
     img = ImageOps.exif_transpose(img).convert("RGB")
     img.thumbnail((MAX_SIDE, MAX_SIDE))
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=88)
+    img.save(buf, format="JPEG", quality=85, optimize=False)
+    return buf.getvalue()
+
+
+@st.cache_data(max_entries=12, show_spinner=False)
+def preview(file_bytes: bytes) -> bytes:
+    """Small copy of a photo just for showing it on screen (a 12MP phone photo is too heavy to redraw on every click)."""
+    img = Image.open(io.BytesIO(file_bytes))
+    if img.format == "JPEG":
+        img.draft("RGB", (700, 700))
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    img.thumbnail((640, 640))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=72)
     return buf.getvalue()
 
 
@@ -233,7 +245,7 @@ class CardStore:
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.pool = ThreadPoolExecutor(max_workers=WORKERS)
+        self.pool = ThreadPoolExecutor(max_workers=max_workers())   # Gemini: several cards at once; offline OCR: follows the CPU
         self.cards = {}      # id -> {id, status, row, front, back, raw, error}
         self.next_id = 1
         self.version = 0     # bumps on every change (used to cache the Excel bytes)
@@ -362,7 +374,7 @@ def to_universal(df: pd.DataFrame) -> pd.DataFrame:
         name = clean(r.get("Name"))
         m = TITLE_RE.match(name)
         if m:
-            row["Title"] = m.group(1).capitalize() + "."
+            row["Title"] = {"ca": "CA", "er": "Er.", "adv": "Adv."}.get(m.group(1).lower(), m.group(1).capitalize() + ".")
             name = name[m.end():].strip()
         words = name.split()
         if len(words) == 1:
@@ -538,7 +550,7 @@ def scan_flow(mode: str):
                     ss.cam_k += 1
                     st.rerun()
             if shots[side]:
-                st.image(shots[side])
+                st.image(preview(shots[side]))
 
     if st.button("✅ Save card", type="primary", disabled=not shots["front"], key=f"{mode}_save"):
         base = f"card_{ss.store.next_id:03d}"
@@ -674,11 +686,13 @@ def main():
         )
         if gemini_engine.enabled():
             fb = gemini_engine.status["fallbacks"]
-            st.caption("🤖 Gemini ON" + (f" · {fb} card(s) offline OCR se read hue (Gemini limit)" if fb else ""))
+            st.caption("🤖 Gemini ON (front + back dono side ek saath read hoti hain)" + (f" · {fb} card(s) offline OCR se read hue (Gemini limit)" if fb else ""))
             if gemini_engine.status["last"]:
                 st.caption(gemini_engine.status["last"])
-        else:
+        elif ocr_fallback_enabled():
             st.caption("💻 Offline OCR mode (Gemini key nahi hai)")
+        else:
+            st.error("GEMINI_API_KEY set nahi hai. Render → Environment me key daaliye, tabhi cards read honge.")
         if get_secret("APP_PASSWORD") and st.button("Logout"):
             st.session_state.clear()
             st.rerun()

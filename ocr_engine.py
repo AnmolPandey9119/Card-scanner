@@ -451,6 +451,11 @@ def parse_card(front_lines: list, back_lines: list) -> dict:
             if re.search(rf"\b{re.escape(st)}\b", addr_text, re.I):
                 add("State", "Delhi" if st == "New Delhi" else st)
                 break
+        if not out["State"]:
+            for st_name, rx in ABBR_IN_TEXT.items():
+                if re.search(rx, addr_text):
+                    add("State", st_name)
+                    break
         for c in COUNTRIES:
             if re.search(rf"\b{re.escape(c)}\b", addr_text, re.I):
                 add("Country", c)
@@ -584,6 +589,21 @@ def _cut_role(text, min_head):
     return text, ""
 
 
+STATE_ABBR = {"UP": "Uttar Pradesh", "MP": "Madhya Pradesh", "HP": "Himachal Pradesh", "AP": "Andhra Pradesh",
+              "TN": "Tamil Nadu", "WB": "West Bengal", "JK": "Jammu & Kashmir", "UK": "Uttarakhand"}
+ABBR_IN_TEXT = {   # printed with dots / brackets inside an address line: "Noida (U.P.)"
+    "Uttar Pradesh": r"\bU\.\s?P\b\.?|\(\s*UP\s*\)", "Madhya Pradesh": r"\bM\.\s?P\b\.?|\(\s*MP\s*\)",
+    "Himachal Pradesh": r"\bH\.\s?P\b\.?|\(\s*HP\s*\)", "Andhra Pradesh": r"\bA\.\s?P\b\.?",
+    "Tamil Nadu": r"\bT\.\s?N\b\.?", "West Bengal": r"\bW\.\s?B\b\.?", "Jammu & Kashmir": r"\bJ\s?&\s?K\b",
+}
+
+
+def _abbr_state(p):
+    """'U.P.' / '(UP)' / 'UP' -> 'Uttar Pradesh' (whole segment only, so normal words are never touched)."""
+    key = re.sub(r"[^A-Za-z&]", "", p).upper().replace("&", "")
+    return STATE_ABBR.get(key) if len(key) == 2 and key != "UK" else None
+
+
 def _is_geo(p):
     q = PIN_RE.sub("", p).strip(" -,.")
     if not q:
@@ -591,7 +611,7 @@ def _is_geo(p):
     m = CITY_ONLY_RE.match(q)
     if m:
         return "city:" + m.group(1)
-    if any(re.fullmatch(re.escape(s), q, re.I) for s in STATES):
+    if any(re.fullmatch(re.escape(s), q, re.I) for s in STATES) or _abbr_state(q):
         return "state"
     return None
 
@@ -648,7 +668,9 @@ def reconcile_row(row: dict) -> dict:
         if m:
             rem = joined[: m.start()].strip(" ,|-\u2013/")
             words = rem.split()
-            if len(words) >= 2 and words[-1].lower() not in _STOP_END:
+            brand_city = re.search(r"\b(?:institute|university|college|school|bank|hospital|academy|council|association)\b",
+                                   rem, re.I)   # 'Indian Institute of Technology Delhi': the city belongs to the name
+            if len(words) >= 2 and words[-1].lower() not in _STOP_END and not brand_city:
                 city = city or m.group(1)
                 joined = rem
         comp = joined.strip()
@@ -656,8 +678,12 @@ def reconcile_row(row: dict) -> dict:
     # ---- city: clean + fill from the address if empty ----
     if city:
         city = PIN_RE.sub("", city)
-        for s in sorted(STATES, key=len, reverse=True):
-            city = re.sub(rf"(?i)[\s,\-]*\b{re.escape(s)}\b", "", city)
+        whole_is_state = any(re.fullmatch(re.escape(s), city.strip(" ,-."), re.I) for s in STATES)
+        for s in ([] if whole_is_state else sorted(STATES, key=len, reverse=True)):   # 'New Delhi' / 'Delhi' stay as they are
+            cut = re.sub(rf"(?i)[\s,\-]*\b{re.escape(s)}\b", "", city).strip(" ,-.")
+            if cut:                      # never wipe the whole city: Delhi / Chandigarh are city AND state
+                city = cut
+        city = "".join(c for c in re.split(r"(?<=[A-Za-z]),\s*", city)[:1]).strip(" ,-.")   # 'Noida, UP' -> 'Noida'
         city = city.strip(" ,-.")
         city = city.title() if city.isupper() else city
     if not city and r.get("Address"):
@@ -667,7 +693,20 @@ def reconcile_row(row: dict) -> dict:
                 city = g[5:].title() if g[5:].isupper() else g[5:]
                 break
 
-    r.update(Company=comp, Designation=desig, City=city)
+    # ---- designation: the company name must not be repeated inside it ('CEO - XYZ Technologies') ----
+    for cname in {c for c in (r.get("Company", ""), comp) if c}:
+        if desig and re.fullmatch(re.escape(cname), desig.strip(), re.I):
+            desig = ""
+            continue
+        cut = re.sub(rf"[\s\-|,:(\[]*\b{re.escape(cname)}\b[\s)\]]*", " ", desig, flags=re.I)
+        cut = re.sub(r"\s+(?:at|of|with|from|@)\s*$", "", cut.strip(" ,-|:()["), flags=re.I).strip(" ,-|:()[")
+        if cut:
+            desig = cut
+
+    state = r.get("State", "")
+    if state and _abbr_state(state):
+        state = _abbr_state(state)
+    r.update(Company=comp, Designation=desig, City=city, State=state)
     return r
 
 
