@@ -6,6 +6,7 @@ Run locally:  streamlit run app.py
 """
 import base64
 import hmac
+import inspect
 import io
 import json
 import os
@@ -27,6 +28,9 @@ MAX_SIDE = 1200   # photos are shrunk to this before being stored / sent (card t
 MAX_PENDING = 60  # max cards being read at the same time
 REFRESH_SECS = 2  # live status refresh while cards are being read (each refresh redraws the table)
 EXTS = ["jpg", "jpeg", "png", "webp"]
+# Browser camera: by default Streamlit takes the photo at the on-screen size (~400px wide on a phone = too blurry to read).
+# Newer Streamlit can ask the camera for 1080p; older versions simply skip this option.
+CAM_KW = {"resolution": "1080p"} if "resolution" in inspect.signature(st.camera_input).parameters else {}
 
 HEADERS = [
     "Name",
@@ -359,7 +363,41 @@ TITLE_RE = re.compile(r"^(mr|mrs|ms|miss|dr|shri|smt|prof|er|ca|adv)\.?\s+", re.
 
 def _parts(value: str) -> list:
     """'a; b ; c' -> ['a', 'b', 'c'] (the reader joins multiple values with '; ')."""
-    return [p.strip() for p in str(value or "").split(";") if p.strip()]
+    return [p.strip() for p in clean(value).split(";") if p.strip()]   # clean(): a missing cell (NaN) is "", never 'nan'
+
+
+def _phone_kind(p: str, default: str) -> str:
+    """'mobile' or 'tele' for one number, decided by the number itself (Indian patterns), not by which box the
+    reader put it in. Foreign / unclear numbers keep the column the card gave."""
+    s = p.strip()
+    if s.startswith("+") and not s.startswith("+91"):
+        return default
+    d = re.sub(r"\D", "", s)
+    if d.startswith("91") and len(d) >= 12:
+        d = d[2:]
+    if len(d) == 11 and d[0] == "0" and d[1] == "9":          # 09876543210
+        return "mobile"
+    if d.startswith(("0", "1800", "1860")):                    # STD code / toll free
+        return "tele"
+    if len(d) == 10 and d[0] in "6789":
+        return "mobile"
+    if len(d) in (10, 11) and d[0] in "12345":                 # STD code written without the leading 0
+        return "tele"
+    return default
+
+
+_SOCIAL_RE = re.compile(r"facebook|instagram|twitter|x\.com|youtube|wa\.me|whatsapp|t\.me|telegram", re.I)
+_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}")
+
+
+def _unique(items: list) -> list:
+    seen, out = set(), []
+    for v in items:
+        k = re.sub(r"\W", "", v).lower()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(v)
+    return out
 
 
 def to_universal(df: pd.DataFrame) -> pd.DataFrame:
@@ -393,11 +431,16 @@ def to_universal(df: pd.DataFrame) -> pd.DataFrame:
 
         remark = []
 
-        # numbers: landline vs fax vs mobile (max 2 each, extra ones go to Remark)
-        tele, fax = [], []
-        for p in _parts(r.get("Phone / Landline")):
-            (fax if re.search(r"\(fax\)", p, re.I) else tele).append(re.sub(r"\s*\(fax\)", "", p, flags=re.I))
-        mobiles = _parts(r.get("Mobile"))
+        # numbers: every number is placed by its own pattern (mobile / landline / fax), max 2 each, extras -> Remark
+        tele, fax, mobiles = [], [], []
+        mobile_field = _parts(r.get("Mobile"))
+        for p in mobile_field + _parts(r.get("Phone / Landline")):    # numbers the card called "mobile" keep first place
+            if re.search(r"\(fax\)|\bfax\b", p, re.I):
+                fax.append(re.sub(r"\s*\(fax\)|\bfax\b[:\s]*", "", p, flags=re.I).strip())
+                continue
+            default = "mobile" if p in mobile_field else "tele"
+            (mobiles if _phone_kind(p, default) == "mobile" else tele).append(p)
+        tele, fax, mobiles = _unique(tele), _unique(fax), _unique(mobiles)
         for col, vals in (("Tele", tele), ("Mobile", mobiles)):
             for i, v in enumerate(vals[:2], start=1):
                 row[f"{col}{i}"] = v
@@ -408,22 +451,32 @@ def to_universal(df: pd.DataFrame) -> pd.DataFrame:
             if len(fax) > 1:
                 remark.append("Extra fax: " + ", ".join(fax[1:]))
 
-        for col, key in (("Email", "Email"), ("Website", "Website")):
-            vals = _parts(r.get(key))
+        # emails / websites / social links: sorted by what the value IS, whichever box it was written in
+        emails, sites, person_in, company_in = [], [], [], []
+        for v in _parts(r.get("Email")) + _parts(r.get("Website")) + _parts(r.get("LinkedIn / Social")):
+            low = v.lower()
+            if _EMAIL_RE.fullmatch(v):
+                emails.append(v)
+            elif "linkedin.com/company" in low or "linkedin.com/school" in low:
+                company_in.append(v)
+            elif "linkedin.com" in low:
+                person_in.append(v)
+            elif _SOCIAL_RE.search(low) or v.startswith("@"):
+                remark.append(v)
+            elif re.search(r"\.[a-z]{2,}", low):
+                sites.append(v)
+            else:
+                remark.append(v)
+        for col, vals in (("Email", _unique(emails)), ("Website", _unique(sites))):
             for i, v in enumerate(vals[:2], start=1):
                 row[f"{col}{i}"] = v
             if len(vals) > 2:
                 remark.append(f"Extra {col.lower()}: " + ", ".join(vals[2:]))
-
-        # social links: LinkedIn person / company get their own column, the rest go to Remark
-        for link in _parts(r.get("LinkedIn / Social")):
-            low = link.lower()
-            if "linkedin.com/company" in low and not row["Company Linked URL"]:
-                row["Company Linked URL"] = link
-            elif "linkedin.com" in low and not row["Person Linked URL"]:
-                row["Person Linked URL"] = link
-            else:
-                remark.append(link)
+        if person_in:
+            row["Person Linked URL"] = person_in[0]
+        if company_in:
+            row["Company Linked URL"] = company_in[0]
+        remark += person_in[1:] + company_in[1:]
 
         if clean(r.get("Other Notes")):
             remark.append(clean(r.get("Other Notes")))
@@ -441,9 +494,9 @@ def to_excel(df: pd.DataFrame) -> bytes:
         df.to_excel(writer, index=False, sheet_name="Sheet1")
         ws = writer.sheets["Sheet1"]
         for cell in ws[1]:   # same look as the company header file: white bold on blue, Calibri 11
-            cell.font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-            cell.fill = PatternFill("solid", fgColor="0070C0")
-            cell.alignment = Alignment(vertical="center")
+            cell.font = Font(name="Calibri", size=11, bold=True, color="FFFFFFFF")
+            cell.fill = PatternFill("solid", fgColor="FF0070C0")
+            cell.alignment = Alignment(horizontal="left")
         text = df.astype(str)
         if text.apply(lambda col: col.str.startswith("=")).to_numpy().any():
             for row in ws.iter_rows(min_row=2):
@@ -514,7 +567,7 @@ def camera_overlay():
             ss.cam_open = None
             ss.cam_k += 1
             st.rerun()
-        shot = st.camera_input("camera", key=f"cam_in_{ss.cam_k}", label_visibility="collapsed")
+        shot = st.camera_input("camera", key=f"cam_in_{ss.cam_k}", label_visibility="collapsed", **CAM_KW)
     if shot is not None:
         ss[f"cam_{side}"] = shot.getvalue()
         ss.cam_open = "back" if (side == "front" and not ss.cam_back) else None
