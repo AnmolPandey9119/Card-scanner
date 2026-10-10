@@ -49,6 +49,16 @@ HEADERS = [
     "Back File",
 ]
 
+# Company's universal Excel header (exact spelling/order of Headers_10_1.xlsx - do not "fix" the
+# trailing space in 'Product Category ' or the 'Business TYpe' spelling, they match the master sheet).
+UNIVERSAL_HEADERS = [
+    "SNO", "Source", "FileName", "Updated By", "Visitors/Exhibitors", "Person Linked URL",
+    "Company Linked URL", "CompanyName", "Sector", "Sub Sector", "Product Category ", "Business TYpe",
+    "Title", "FirstName", "LastName", "Designation", "Address", "City", "Pincode", "State", "Country",
+    "Tele1", "Tele2", "Mobile1", "Mobile2", "Fax", "Email1", "Email2", "Website1", "Website2",
+    "Status", "Remark", "Rank", "Date of Update", "Event",
+]
+
 # Browser camera: ask for the BACK camera by default (falls back to whatever camera exists,
 # so laptops with a single webcam keep working). Streamlit's camera widget always asks
 # for the front camera, so we wrap getUserMedia in the main page once, and also switch a
@@ -298,16 +308,95 @@ class CardStore:
         return data
 
 
+TITLE_RE = re.compile(r"^(mr|mrs|ms|miss|dr|shri|smt|prof|er|ca|adv)\.?\s+", re.I)
+
+
+def _parts(value: str) -> list:
+    """'a; b ; c' -> ['a', 'b', 'c'] (the reader joins multiple values with '; ')."""
+    return [p.strip() for p in str(value or "").split(";") if p.strip()]
+
+
+def to_universal(df: pd.DataFrame) -> pd.DataFrame:
+    """Scanner columns -> company's universal header layout.
+    Anything the card does not give stays blank (Source, FileName, Updated By, Sector, ...)."""
+    out = []
+    for n, (_, r) in enumerate(df.iterrows(), start=1):
+        row = {h: "" for h in UNIVERSAL_HEADERS}
+        row["SNO"] = n
+
+        # name -> Title / FirstName / LastName
+        name = clean(r.get("Name"))
+        m = TITLE_RE.match(name)
+        if m:
+            row["Title"] = m.group(1).capitalize() + "."
+            name = name[m.end():].strip()
+        words = name.split()
+        if len(words) == 1:
+            row["FirstName"] = words[0]
+        elif words:
+            row["FirstName"], row["LastName"] = " ".join(words[:-1]), words[-1]
+
+        row["CompanyName"] = clean(r.get("Company"))
+        row["Designation"] = clean(r.get("Designation"))
+        row["Product Category "] = clean(r.get("Services / Products"))
+        row["Address"] = clean(r.get("Address"))
+        row["City"] = clean(r.get("City"))
+        row["Pincode"] = clean(r.get("Pincode"))
+        row["State"] = clean(r.get("State"))
+        row["Country"] = clean(r.get("Country"))
+
+        remark = []
+
+        # numbers: landline vs fax vs mobile (max 2 each, extra ones go to Remark)
+        tele, fax = [], []
+        for p in _parts(r.get("Phone / Landline")):
+            (fax if re.search(r"\(fax\)", p, re.I) else tele).append(re.sub(r"\s*\(fax\)", "", p, flags=re.I))
+        mobiles = _parts(r.get("Mobile"))
+        for col, vals in (("Tele", tele), ("Mobile", mobiles)):
+            for i, v in enumerate(vals[:2], start=1):
+                row[f"{col}{i}"] = v
+            if len(vals) > 2:
+                remark.append(f"Extra {col.lower()}: " + ", ".join(vals[2:]))
+        if fax:
+            row["Fax"] = fax[0]
+            if len(fax) > 1:
+                remark.append("Extra fax: " + ", ".join(fax[1:]))
+
+        for col, key in (("Email", "Email"), ("Website", "Website")):
+            vals = _parts(r.get(key))
+            for i, v in enumerate(vals[:2], start=1):
+                row[f"{col}{i}"] = v
+            if len(vals) > 2:
+                remark.append(f"Extra {col.lower()}: " + ", ".join(vals[2:]))
+
+        # social links: LinkedIn person / company get their own column, the rest go to Remark
+        for link in _parts(r.get("LinkedIn / Social")):
+            low = link.lower()
+            if "linkedin.com/company" in low and not row["Company Linked URL"]:
+                row["Company Linked URL"] = link
+            elif "linkedin.com" in low and not row["Person Linked URL"]:
+                row["Person Linked URL"] = link
+            else:
+                remark.append(link)
+
+        if clean(r.get("Other Notes")):
+            remark.append(clean(r.get("Other Notes")))
+        row["Remark"] = " | ".join(remark)
+        out.append(row)
+    return pd.DataFrame(out, columns=UNIVERSAL_HEADERS)
+
+
 def to_excel(df: pd.DataFrame) -> bytes:
     from openpyxl.styles import Alignment, Font, PatternFill
 
+    df = to_universal(df)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Cards")
-        ws = writer.sheets["Cards"]
-        for cell in ws[1]:
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill("solid", fgColor="1F4E78")
+        df.to_excel(writer, index=False, sheet_name="Sheet1")
+        ws = writer.sheets["Sheet1"]
+        for cell in ws[1]:   # same look as the company header file: white bold on blue, Calibri 11
+            cell.font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="0070C0")
             cell.alignment = Alignment(vertical="center")
         for row in ws.iter_rows(min_row=2):
             for c in row:  # text from a card must never run as an Excel formula
