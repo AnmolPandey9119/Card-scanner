@@ -3,11 +3,12 @@
 Why it is fast / does not break on the free tier:
   1. ONE request per card: both sides are sent together (each labelled FRONT / BACK) so the model
      merges them into a single row - details printed only on the back also land in the Excel.
-  2. Thinking is switched off for 2.5-flash (it is the main reason for slow answers); the prompt makes the
-     model transcribe the card first and then fill the columns, which keeps accuracy high without thinking.
+  2. Thinking is kept at the lowest level the model allows (it is the main reason for slow answers); the prompt makes
+     the model transcribe the card first and then fill the columns, which keeps accuracy high without thinking.
   3. Every model has its own requests-per-minute window. If the main model is busy for a long time the next
      model in GEMINI_MODELS takes the card instead of everybody waiting.
-  4. HTTP 429: waits for the retryDelay Google asks for; a finished DAILY quota parks that model for an hour.
+  4. HTTP 429: waits for the retryDelay Google asks for; a finished DAILY quota (or a 404 "model not available")
+     parks that model for an hour, so it is not asked again for every card.
   5. Connections are reused (keep-alive), identical cards are cached so "Retry" never wastes a request.
   6. If every model is exhausted it raises QuotaExhausted (the app then shows a clear "Retry" message).
 
@@ -28,7 +29,9 @@ from collections import deque
 import requests
 from requests.adapters import HTTPAdapter
 
-DEFAULT_MODELS = "gemini-2.5-flash,gemini-2.5-flash-lite"
+# Gemini 2.5 models are closed for NEW projects (since Sept 2026) -> 404. These are the current free-tier models.
+# Each model has its own quota, so when one is busy the next one takes the card.
+DEFAULT_MODELS = "gemini-3.8-flash,gemini-3.5-flash,gemini-3.5-flash-lite"
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 FIELDS = ["Name", "Designation", "Company", "Mobile", "Phone / Landline", "Email", "Website", "Address",
           "City", "State", "Pincode", "Country", "LinkedIn / Social", "Services / Products", "Other Notes"]
@@ -187,14 +190,28 @@ def _pick_model(models, dead, deadline):
         time.sleep(max(min(waits), 0.1))
 
 
+def _thinking_cfg(model):
+    """Lowest-latency thinking setting each model family accepts (None = leave the model default)."""
+    if model in _no_think:
+        return None
+    if re.search(r"gemini-2\.5", model):
+        return {"thinkingBudget": 0}                 # 2.5 models: budget 0 = off
+    if re.search(r"gemini-3\.[78]-", model):
+        return {"thinkingLevel": "low"}              # 3.7 / 3.8 Flash do not allow "minimal"
+    return {"thinkingLevel": "minimal"}              # 3.5 Flash, 3.x Flash-Lite
+
+
 def _call(model, images, key):
     parts = [{"text": PROMPT}]
     for label, b in images:
         parts.append({"text": f"{label} image:"})
         parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(b).decode()}})
-    gen = {"temperature": 0, "responseMimeType": "application/json", "maxOutputTokens": 2048}
-    if model not in _no_think:
-        gen["thinkingConfig"] = {"thinkingBudget": 0}    # no hidden "thinking" time: 2-4x faster answers
+    gen = {"responseMimeType": "application/json", "maxOutputTokens": 2048}
+    if "gemini-2.5" in model:
+        gen["temperature"] = 0                            # Gemini 3 models are best left at their default temperature
+    think = _thinking_cfg(model)
+    if think:
+        gen["thinkingConfig"] = think                     # no long hidden "thinking": much faster answers
     return _session().post(API_URL.format(model=model), headers={"x-goog-api-key": key},
                            json={"contents": [{"parts": parts}], "generationConfig": gen}, timeout=(8, 60))
 
@@ -228,6 +245,7 @@ def read_card_gemini(front_jpeg, back_jpeg) -> dict:
 
     models, dead, bad = _models(), set(), {}
     deadline = time.time() + MAX_CARD_WAIT
+    errs = {}                                  # model -> last problem, shown together if everything fails
     last_err = "unknown error"
     for attempt in range(10):
         model = _pick_model(models, dead, deadline)
@@ -244,7 +262,7 @@ def read_card_gemini(front_jpeg, back_jpeg) -> dict:
             try:
                 result = _parse(resp)
             except Exception as e:        # blocked / malformed output -> try again, then the next model
-                last_err = f"{model}: bad response ({e})"
+                last_err = errs[model] = f"{model}: bad response ({e})"
                 bad[model] = bad.get(model, 0) + 1
                 if bad[model] >= 2:
                     dead.add(model)
@@ -258,21 +276,24 @@ def read_card_gemini(front_jpeg, back_jpeg) -> dict:
         if code == 429:
             if _is_daily(resp):           # per-day quota finished: park this model for 1 hour
                 _cooldown[model] = time.time() + 3600
-                last_err = f"{model}: daily quota finished"
+                last_err = errs[model] = f"{model}: daily quota finished"
             else:
                 delay = min(_retry_delay(resp), 60) + 1
                 _cooldown[model] = time.time() + delay
-                last_err = f"{model}: rate limited ({delay:.0f}s wait)"
+                last_err = errs[model] = f"{model}: rate limited ({delay:.0f}s wait)"
             continue
         if code in (500, 502, 503, 504):
-            last_err = f"{model}: server busy ({code})"
+            last_err = errs[model] = f"{model}: server busy ({code})"
             time.sleep(min(3 * (attempt + 1), 8))
             continue
         if code == 400 and "thinking" in resp.text.lower() and model not in _no_think:
             _no_think.add(model)          # this model does not accept thinkingConfig -> retry without it
             continue
         dead.add(model)                   # bad key (400/403), retired model (404), anything else
-        last_err = f"{model}: HTTP {code} {resp.text[:150]}"
+        if code == 404:                   # model closed / renamed: do not ask it again for every card
+            _cooldown[model] = time.time() + 3600
+        last_err = errs[model] = f"{model}: HTTP {code} {re.sub(r'\\s+', ' ', resp.text)[:110]}"
+    last_err = " | ".join(errs.values()) or last_err
     with _state_lock:
         status["last"] = f"Gemini limit/err: {last_err}"
     raise QuotaExhausted(last_err)
