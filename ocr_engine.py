@@ -130,7 +130,14 @@ def _flatness(items):
 
 def _flat(arr) -> float:
     """Median width/height of detected text boxes (detection only, ~5x cheaper than a full read)."""
-    boxes, _ = _get_engine().text_detector(arr)
+    eng = _get_engine()
+    det = getattr(eng, "text_det", None) or getattr(eng, "text_detector", None)   # name differs between rapidocr versions
+    if det is None:
+        return 0.0
+    try:
+        boxes, _ = det(arr)
+    except Exception:
+        return 0.0   # rotation check is only a speed-up; never fail the card because of it
     if boxes is None or len(boxes) == 0:
         return 0.0
     r = sorted((float(np.ptp(b[:, 0])) + 1) / (float(np.ptp(b[:, 1])) + 1) for b in boxes)
