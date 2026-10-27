@@ -16,6 +16,10 @@ GEMINI_PARALLEL = 6                                          # Gemini work is wa
 _ocr_gate = threading.Semaphore(OCR_PARALLEL)
 
 
+class ReaderBusy(RuntimeError):
+    """Gemini could not read the card right now (limit / busy). The card is NOT lost - it is retried automatically."""
+
+
 def cpu_budget() -> float:
     return ocr_engine.cpu_budget()
 
@@ -41,7 +45,7 @@ def read_card(front_jpeg, back_jpeg) -> dict:
             return ocr_engine.reconcile_row(gemini_engine.read_card_gemini(front_jpeg, back_jpeg))
         except gemini_engine.QuotaExhausted as e:
             if not ocr_fallback_enabled():   # no silent low-quality reading: the card can be retried later
-                raise RuntimeError(f"Gemini abhi card read nahi kar paya ({e}). Thodi der baad 'Retry failed cards' dabaiye.")
+                raise ReaderBusy(f"Gemini abhi card read nahi kar paya ({e}). Thodi der baad 'Retry failed cards' dabaiye.")
             gemini_engine.status["fallbacks"] += 1   # backup is on -> do NOT lose the card
     elif not ocr_fallback_enabled():
         raise RuntimeError("GEMINI_API_KEY set nahi hai. Render > Environment me key daaliye (ya OCR_FALLBACK=1 rakhiye).")

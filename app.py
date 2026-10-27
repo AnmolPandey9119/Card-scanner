@@ -21,6 +21,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 
+import db
 import gemini_engine
 from card_reader import max_workers, ocr_fallback_enabled, read_card, warmup
 
@@ -318,14 +319,31 @@ class CardStore:
     Each card: reading -> done | failed. Rows live here, so the Excel is always
     up to date with whatever has finished reading."""
 
-    def __init__(self):
+    def __init__(self, token: str = ""):
+        self.token = token   # session token: database rows are saved under it
         self.lock = threading.Lock()
         self.pool = ThreadPoolExecutor(max_workers=max_workers())   # Gemini: several cards at once; offline OCR: follows the CPU
         self.cards = {}      # id -> {id, status, row, front, back, raw, error}
         self.next_id = 1
         self.version = 0     # bumps on every change (used to cache the Excel bytes)
-        self._xlsx = (-1, b"")
+        self._xlsx = (-1, b"", [])   # (version, excel bytes, card ids inside that excel)
         self._df = (-1, None)   # (version, DataFrame): the table is rebuilt only when something changed
+
+    # ---- database restore ----
+    def restore(self) -> int:
+        """Load this session's un-exported cards from Neon (after a restart / timeout / refresh)."""
+        rows = db.load(self.token)
+        if not rows:
+            return 0
+        with self.lock:
+            for cid, _status, data in rows:
+                row = {h: clean((data or {}).get(h)) for h in HEADERS}
+                # photos are not kept, so a restored card is a normal editable row ("Retry" is not possible for it)
+                self.cards[cid] = {"id": cid, "status": "done", "row": row, "front": None, "back": None,
+                                   "raw": False, "error": ""}
+            self.next_id = max(self.next_id, max(r[0] for r in rows) + 1)
+            self.version += 1
+        return len(rows)
 
     # ---- adding / reading ----
     def submit(self, front, back, raw=False) -> int:
@@ -363,6 +381,7 @@ class CardStore:
             card.update(status=status, row=row, error=err, front=front if keep else None,
                         back=back if keep else None, raw=False)
             self.version += 1
+        db.save(self.token, cid, status, row)   # finished row goes to Neon right away (until it is exported)
 
     def retry_failed(self) -> int:
         with self.lock:
@@ -405,43 +424,55 @@ class CardStore:
 
     # ---- edits from the table ----
     def apply_edits(self, edited: pd.DataFrame):
+        to_save, to_delete = [], []
         with self.lock:
             for cid, rec in edited.iterrows():
-                card = self.cards.get(int(cid))
+                cid = int(cid)
+                card = self.cards.get(cid)
                 if card is None:
                     continue
                 if bool(rec.get("Delete")):
-                    del self.cards[int(cid)]
+                    del self.cards[cid]
+                    to_delete.append(cid)
                     continue
                 new_row = {h: clean(rec.get(h)) for h in HEADERS}
                 if new_row != card["row"]:
                     card["row"] = new_row
                     if card["status"] == "failed":   # fixed by hand
                         card.update(status="done", error="")
+                    to_save.append((cid, card["status"], new_row))
             self.version += 1
+        db.delete_many(self.token, to_delete)   # keep Neon in sync with the table
+        db.save_many(self.token, to_save)
 
     def remove(self, ids):
+        ids = [int(i) for i in ids]
         with self.lock:
             for i in ids:
-                self.cards.pop(int(i), None)
+                self.cards.pop(i, None)
             self.version += 1
+        db.delete_many(self.token, ids)
 
     def clear_all(self):
         with self.lock:
             self.cards.clear()
             self.version += 1
+        db.delete_token(self.token)
 
     # ---- Excel, always ready ----
-    def excel_bytes(self) -> bytes:
+    def excel_with_ids(self):
+        """(excel bytes, card ids inside it). The ids are exactly the rows of this file, so after the download
+        only these cards are removed (a card that finished reading a second later stays)."""
         with self.lock:
-            cached_version, cached = self._xlsx
+            cached_version, cached, cached_ids = self._xlsx
             version = self.version
         if cached_version == version:
-            return cached
-        data = to_excel(self.dataframe())
+            return cached, cached_ids
+        df = self.dataframe()
+        data, ids = to_excel(df), [int(i) for i in df.index]
         with self.lock:
-            self._xlsx = (version, data)
-        return data
+            self._xlsx = (version, data, ids)
+        return data, ids
 
 
 TITLE_RE = re.compile(r"^(mr|mrs|ms|miss|dr|shri|smt|prof|er|ca|adv)\.?\s+", re.I)
@@ -667,13 +698,21 @@ def get_store():
     _gc_stores()
     reg = _registry()
     token = st.query_params.get("s", "")
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{6,40}", token or ""):
+        token = ""
     with reg["lock"]:
         entry = reg["stores"].get(token) if token else None
         if entry:
             entry[1] = time.time()
     if entry:
         return token, entry[0]
-    token, store = secrets.token_urlsafe(9), CardStore()
+    # not in memory (server restarted / session timed out / new link): keep the SAME token from the URL and
+    # bring this session's un-exported cards back from Neon.
+    token = token or secrets.token_urlsafe(9)
+    store = CardStore(token)
+    n = store.restore()
+    if n:
+        st.session_state.flash = f"{n} purane card(s) database se wapas aa gaye ✅"
     _register(token, store)
     st.query_params["s"] = token
     return token, store
@@ -894,6 +933,15 @@ EMPTY_HTML = (
 )
 
 
+def after_export(ids):
+    """on_click of the Export button: the cards that went into the Excel are removed from the table and from Neon."""
+    ss = st.session_state
+    if ids and "store" in ss:
+        ss.store.remove(ids)
+        ss.editor_ver += 1
+        ss.flash = f"{len(ids)} card(s) export ho gaye aur database se hata diye ✅"
+
+
 def results_panel():
     """Live status + editable table + Export. Auto-refreshes while cards are being read."""
     ss = st.session_state
@@ -958,23 +1006,28 @@ def results_panel():
                     st.rerun()
 
     n_ready = counts["done"] + counts["failed"]
+    xlsx, xlsx_ids = store.excel_with_ids() if n_ready else (b"", [])
     with st.container(key="exportbar"):
         st.download_button(
             f"⬇️ Export Excel ({n_ready} cards)",
-            data=store.excel_bytes if DL_LAZY else store.excel_bytes(),   # lazy: built only on click
+            data=xlsx,
             file_name=time.strftime("Cards_%Y-%m-%d_%H-%M.xlsx"),
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
             disabled=n_ready == 0,
-            **({"on_click": "ignore"} if DL_LAZY else {}),   # downloading does not re-run the page
+            on_click=after_export,      # download ke turant baad ye cards table + Neon se hat jate hain
+            args=(xlsx_ids,),
         )
+    if db.enabled():
+        st.caption("🗄️ Cards Neon database me save hain. Export dabate hi export hue cards database se hata diye jate hain.")
     if counts["reading"]:
         st.caption(f"⏳ {counts['reading']} card(s) abhi read ho rahe hain. Export abhi tak ke ready cards ka hoga; baaki ready hote hi table aur Excel me aa jayenge.")
 
     with st.expander("Aur options"):
         if st.button("🗑️ Sab cards clear karo"):
             old = ss.store
-            ss.store = CardStore()
+            db.delete_token(ss.token)          # Neon se bhi saaf
+            ss.store = CardStore(ss.token)
             _register(ss.token, ss.store)
             old.pool.shutdown(wait=False, cancel_futures=True)
             ss.editor_ver += 1
@@ -1003,6 +1056,22 @@ def sidebar():
             st.caption("💻 Offline OCR mode (Gemini key nahi hai)")
         else:
             st.error("GEMINI_API_KEY set nahi hai. Render → Environment me key daaliye, tabhi cards read honge.")
+        if db.enabled():
+            st.caption("🗄️ Neon database ON · cards export hone tak safe rehte hain")
+            if db.status["error"]:
+                st.error("Database problem: " + db.status["error"])
+            ss = st.session_state
+            others = [x for x in db.pending_sessions() if x[0] != ss.get("token")]
+            if others:
+                with st.expander(f"⏸ Adhoore kaam ({len(others)})"):
+                    for t, n, when in others:
+                        if st.button(f"{n} card(s) · {when}", key=f"resume_{t}"):
+                            ss.pop("store", None)
+                            ss.pop("token", None)
+                            st.query_params["s"] = t
+                            st.rerun()
+        else:
+            st.warning("DATABASE_URL set nahi hai: cards sirf memory me hain, restart par chale jayenge.")
         st.caption("💾 Page refresh ya phone lock hone par bhi cards bache rehte hain. Isi link ko laptop par kholo to wahi cards dikhenge.")
         if get_secret("APP_PASSWORD") and st.button("Logout"):
             st.query_params.clear()
@@ -1014,7 +1083,7 @@ def main():
     st.set_page_config(page_title="Visiting Card Scanner", page_icon="📇", layout="wide")
     if get_secret("GEMINI_API_KEY"):   # make secrets visible to gemini_engine
         os.environ["GEMINI_API_KEY"] = get_secret("GEMINI_API_KEY")
-    for _k in ("GEMINI_MODELS", "GEMINI_RPM", "OCR_FALLBACK"):
+    for _k in ("GEMINI_MODELS", "GEMINI_RPM", "OCR_FALLBACK", "DATABASE_URL"):
         if get_secret(_k):
             os.environ[_k] = get_secret(_k)
     warmup()   # loads the offline OCR model only when it can really be used
